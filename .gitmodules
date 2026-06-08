@@ -1,0 +1,4 @@
+[submodule "lancedb"]
+	path = lancedb
+	url = https://github.com/westonpace/lancedb.git
+	branch = feat-elastic-dataloader
