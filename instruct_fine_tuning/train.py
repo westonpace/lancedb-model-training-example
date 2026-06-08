@@ -6,9 +6,13 @@ Prerequisites:
     1. Build lancedb from the submodule:
            cd lancedb/python && maturin develop --release && cd ../..
     2. Install dependencies:
-           pip install transformers peft accelerate
+           pip install transformers peft accelerate object-store-python
     3. Prepare data:
-           python prepare_data.py
+           LANCEDB_URI=s3://my-bucket/data python prepare_data.py
+
+Required environment variables:
+    LANCEDB_URI      URI of the LanceDB database  (e.g. s3://my-bucket/data)
+    CHECKPOINT_URI   URI for checkpoint storage    (e.g. s3://my-bucket/checkpoints)
 
 Single GPU:
     python train.py
@@ -17,10 +21,13 @@ Single GPU:
     torchrun --nproc_per_node=8 train.py
 """
 
+import io
 import os
 import sys
 import logging
 import time
+import tempfile
+from urllib.parse import urlparse
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lancedb", "python", "python"))
 
@@ -30,6 +37,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model, TaskType
+from object_store import ObjectStore
 import lancedb
 from lancedb.streaming import StreamingDataset
 
@@ -39,19 +47,17 @@ from lancedb.streaming import StreamingDataset
 #   "microsoft/Phi-3-mini-4k-instruct"
 MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 
-DB_PATH = "./data"
 TABLE_NAME = "alpaca"
 
 NUM_EPOCHS = 100
-# Must divide num_rows AND (world_size * NUM_WORKERS).
-# 64 works for 8 GPUs with 1, 2, 4 or 8 DataLoader workers.
+# Must divide evenly into world_size.
+# 64 works for 1, 2, 4, 8, 16, or 32 GPUs.
 NUM_SPLITS = 64
 NUM_WORKERS = 0       # DataLoader workers per GPU. Start at 0; increase if I/O bound.
 BATCH_SIZE = 4        # Per-GPU micro-batch size.
 MAX_LENGTH = 512      # Truncate sequences to this many tokens.
 SHUFFLE_SEED = 42
 LEARNING_RATE = 2e-4
-CHECKPOINT_DIR = "./checkpoints"
 LOG_INTERVAL = 50     # Log throughput every N steps.
 
 # LoRA
@@ -76,6 +82,39 @@ def setup_distributed():
 def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
+
+
+# ── Checkpoint helpers ─────────────────────────────────────────────────────────
+
+def _parse_uri(uri: str):
+    """Return (ObjectStore base URL, path prefix) from a full URI."""
+    parsed = urlparse(uri)
+    if parsed.scheme in ("s3", "gs", "az", "abfs"):
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        prefix = parsed.path.lstrip("/")
+    else:
+        base = uri
+        prefix = ""
+    return base, prefix
+
+
+def save_checkpoint(store: ObjectStore, prefix: str, name: str, obj) -> None:
+    buf = io.BytesIO()
+    torch.save(obj, buf)
+    buf.seek(0)
+    key = f"{prefix}/{name}" if prefix else name
+    store.put(key, buf)
+
+
+def save_adapter(store: ObjectStore, prefix: str, model, tokenizer) -> None:
+    """Save a PEFT adapter to object storage via a temporary local directory."""
+    with tempfile.TemporaryDirectory() as tmp:
+        model.save_pretrained(tmp)
+        tokenizer.save_pretrained(tmp)
+        for fname in os.listdir(tmp):
+            key = f"{prefix}/final_adapter/{fname}" if prefix else f"final_adapter/{fname}"
+            with open(os.path.join(tmp, fname), "rb") as f:
+                store.put(key, f.read())
 
 
 # ── Data helpers ───────────────────────────────────────────────────────────────
@@ -125,9 +164,25 @@ def main():
         datefmt="%H:%M:%S",
     )
 
+    # ── Environment ───────────────────────────────────────────────────────────
+    lancedb_uri = os.environ.get("LANCEDB_URI")
+    if not lancedb_uri:
+        print("Error: LANCEDB_URI environment variable is not set.")
+        sys.exit(1)
+
+    checkpoint_uri = os.environ.get("CHECKPOINT_URI")
+    if not checkpoint_uri:
+        print("Error: CHECKPOINT_URI environment variable is not set.")
+        sys.exit(1)
+
+    checkpoint_store_base, checkpoint_prefix = _parse_uri(checkpoint_uri)
+    checkpoint_store = ObjectStore(checkpoint_store_base)
+
     if is_main:
         logging.info(f"World size: {world_size}")
         logging.info(f"Model: {MODEL_NAME}")
+        logging.info(f"LanceDB: {lancedb_uri}")
+        logging.info(f"Checkpoints: {checkpoint_uri}")
 
     # ── Model + tokenizer ──────────────────────────────────────────────────────
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -156,13 +211,12 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
     # ── LanceDB ───────────────────────────────────────────────────────────────
-    db = lancedb.connect(DB_PATH)
+    db = lancedb.connect(lancedb_uri)
     table = db.open_table(TABLE_NAME)
     if is_main:
         logging.info(f"LanceDB table: {len(table)} rows, {NUM_SPLITS} splits")
 
     collate_fn = make_collate_fn(tokenizer)
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
     # ── Training loop ─────────────────────────────────────────────────────────
     total_tokens = 0
@@ -238,7 +292,10 @@ def main():
                 "dataset_state": dataset.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
             }
-            torch.save(checkpoint, f"{CHECKPOINT_DIR}/checkpoint_epoch_{epoch + 1:03d}.pt")
+            save_checkpoint(
+                checkpoint_store, checkpoint_prefix,
+                f"checkpoint_epoch_{epoch + 1:03d}.pt", checkpoint,
+            )
 
     if is_main:
         elapsed = time.perf_counter() - training_start
@@ -250,9 +307,8 @@ def main():
         )
         # Save final LoRA adapter
         base = model.module if world_size > 1 else model
-        base.save_pretrained(f"{CHECKPOINT_DIR}/final_adapter")
-        tokenizer.save_pretrained(f"{CHECKPOINT_DIR}/final_adapter")
-        logging.info(f"Adapter saved to {CHECKPOINT_DIR}/final_adapter")
+        save_adapter(checkpoint_store, checkpoint_prefix, base, tokenizer)
+        logging.info(f"Adapter saved to {checkpoint_uri}/final_adapter")
 
     cleanup_distributed()
 
