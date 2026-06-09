@@ -16,12 +16,22 @@ RUN pip install --no-cache-dir \
     pyarrow \
     object-store-python
 
-# Copy the lancedb submodule source and build the Rust extension.
-# maturin develop places the compiled _lancedb.so alongside the Python source,
-# which is where the sys.path.insert in the training scripts expects to find it.
+# Copy only the files required for Rust compilation. Keeping these in their own
+# layers means that changes to the pure Python source below do not invalidate
+# the Rust build cache.
 WORKDIR /workspace
-COPY lancedb/ lancedb/
+COPY lancedb/Cargo.toml lancedb/Cargo.lock lancedb/rust-toolchain.toml lancedb/
+COPY lancedb/rust/ lancedb/rust/
+COPY lancedb/python/Cargo.toml lancedb/python/build.rs lancedb/python/pyproject.toml lancedb/python/
+COPY lancedb/python/src/ lancedb/python/src/
+
+# Compile the Rust extension (~5-10 min, cached until Rust source changes).
+# maturin develop places _lancedb.so alongside the Python source, which is
+# where the sys.path.insert in the training scripts expects to find it.
 RUN cd lancedb/python && maturin develop --release
+
+# Copy pure Python source in a separate layer. Changes here skip the Rust build.
+COPY lancedb/python/python/ lancedb/python/python/
 
 # Copy training scripts.
 COPY prepare_data.py train.py ./
