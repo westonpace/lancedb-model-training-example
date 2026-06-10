@@ -40,9 +40,12 @@ COPY lancedb/python/ lancedb/python/
 # Python source changes, the COPY layer above is invalidated and this RUN
 # re-executes, but cargo finds all artifacts already compiled and maturin
 # simply re-packages — taking seconds rather than minutes.
+# CARGO_TARGET_DIR is set outside the workspace to avoid overlayfs interactions
+# between the cache mount and the source tree.
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
-    --mount=type=cache,target=/workspace/lancedb/target \
+    --mount=type=cache,target=/cargo-target \
+    CARGO_TARGET_DIR=/cargo-target \
     cd lancedb/python && \
     maturin build --release --out /tmp/wheels && \
     pip install /tmp/wheels/*.whl && \
