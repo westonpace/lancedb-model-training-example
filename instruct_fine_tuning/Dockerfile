@@ -28,12 +28,22 @@ COPY lancedb/python/Cargo.toml lancedb/python/build.rs lancedb/python/pyproject.
 COPY lancedb/python/src/ lancedb/python/src/
 
 # Compile the Rust extension (~5-10 min, cached until Rust source changes).
-# maturin develop places _lancedb.so alongside the Python source, which is
-# where the sys.path.insert in the training scripts expects to find it.
-RUN cd lancedb/python && maturin develop --release
+# maturin develop requires a virtualenv which the NGC container doesn't have,
+# so we build a wheel and pip-install it into the system Python instead.
+RUN cd lancedb/python && \
+    maturin build --release --out /tmp/wheels && \
+    pip install /tmp/wheels/*.whl && \
+    rm -rf /tmp/wheels
 
 # Copy pure Python source in a separate layer. Changes here skip the Rust build.
 COPY lancedb/python/python/ lancedb/python/python/
+
+# Copy the compiled extension into the source tree so that the sys.path.insert
+# in the training scripts can find it alongside the Python files.
+RUN python -c "\
+import shutil, glob, os, lancedb; \
+so = glob.glob(os.path.join(os.path.dirname(lancedb.__file__), '_lancedb*.so'))[0]; \
+shutil.copy(so, '/workspace/lancedb/python/python/lancedb/')"
 
 # Copy training scripts.
 COPY prepare_data.py train.py ./
