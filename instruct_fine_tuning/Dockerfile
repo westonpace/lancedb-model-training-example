@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # NGC PyTorch base includes CUDA, cuDNN, NCCL, and PyTorch pre-installed.
 # 25.11 ships with CUDA 13.0.2, matching the maximum supported by driver 580.
 # Upgrade this tag when the host driver is updated (25.12+ requires CUDA 13.1+).
@@ -18,29 +19,34 @@ RUN pip install --no-cache-dir \
     pyarrow \
     object-store-python
 
-# Copy only the files required for Rust compilation. Keeping these in their own
-# layers means that changes to the pure Python source below do not invalidate
-# the Rust build cache.
 WORKDIR /workspace
+
+# Copy Rust workspace root files and all non-Python lancedb source.
 COPY lancedb/Cargo.toml lancedb/Cargo.lock lancedb/rust-toolchain.toml lancedb/
 COPY lancedb/rust/ lancedb/rust/
+# Cargo workspace lists nodejs as a member; it needs a Cargo.toml and stub
+# source file to satisfy manifest parsing even though we never compile it.
 COPY lancedb/nodejs/Cargo.toml lancedb/nodejs/
-# Cargo validates that src/lib.rs exists during manifest parsing. Create a
-# stub so cargo metadata succeeds without needing the full nodejs source.
 RUN mkdir -p lancedb/nodejs/src && touch lancedb/nodejs/src/lib.rs
-COPY lancedb/python/Cargo.toml lancedb/python/build.rs lancedb/python/pyproject.toml lancedb/python/README.md lancedb/python/
-COPY lancedb/python/src/ lancedb/python/src/
 
-# Compile the Rust extension (~5-10 min, cached until Rust source changes).
-# maturin develop requires a virtualenv which the NGC container doesn't have,
-# so we build a wheel and pip-install it into the system Python instead.
-RUN cd lancedb/python && \
+# Copy the entire python directory (maturin requires the Python source present
+# when building the wheel so it can bundle it alongside the compiled extension).
+COPY lancedb/python/ lancedb/python/
+
+# Compile the Rust extension and install the resulting wheel.
+#
+# The --mount=type=cache lines persist the Cargo registry and compiled
+# artifacts between docker build invocations on the same machine. When only
+# Python source changes, the COPY layer above is invalidated and this RUN
+# re-executes, but cargo finds all artifacts already compiled and maturin
+# simply re-packages — taking seconds rather than minutes.
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/workspace/lancedb/target \
+    cd lancedb/python && \
     maturin build --release --out /tmp/wheels && \
     pip install /tmp/wheels/*.whl && \
     rm -rf /tmp/wheels
-
-# Copy pure Python source in a separate layer. Changes here skip the Rust build.
-COPY lancedb/python/python/ lancedb/python/python/
 
 # Copy the compiled extension into the source tree so that the sys.path.insert
 # in the training scripts can find it alongside the Python files.
