@@ -28,7 +28,7 @@ COPY lancedb/nodejs/Cargo.toml lancedb/nodejs/
 # Cargo validates that src/lib.rs exists during manifest parsing. Create a
 # stub so cargo metadata succeeds without needing the full nodejs source.
 RUN mkdir -p lancedb/nodejs/src && touch lancedb/nodejs/src/lib.rs
-COPY lancedb/python/Cargo.toml lancedb/python/build.rs lancedb/python/pyproject.toml lancedb/python/
+COPY lancedb/python/Cargo.toml lancedb/python/build.rs lancedb/python/pyproject.toml lancedb/python/README.md lancedb/python/
 COPY lancedb/python/src/ lancedb/python/src/
 
 # Compile the Rust extension (~5-10 min, cached until Rust source changes).
