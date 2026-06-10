@@ -25,6 +25,9 @@ WORKDIR /workspace
 COPY lancedb/Cargo.toml lancedb/Cargo.lock lancedb/rust-toolchain.toml lancedb/
 COPY lancedb/rust/ lancedb/rust/
 COPY lancedb/nodejs/Cargo.toml lancedb/nodejs/
+# Cargo validates that src/lib.rs exists during manifest parsing. Create a
+# stub so cargo metadata succeeds without needing the full nodejs source.
+RUN mkdir -p lancedb/nodejs/src && touch lancedb/nodejs/src/lib.rs
 COPY lancedb/python/Cargo.toml lancedb/python/build.rs lancedb/python/pyproject.toml lancedb/python/
 COPY lancedb/python/src/ lancedb/python/src/
 
