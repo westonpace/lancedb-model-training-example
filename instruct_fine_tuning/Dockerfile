@@ -1,5 +1,7 @@
 # NGC PyTorch base includes CUDA, cuDNN, NCCL, and PyTorch pre-installed.
-FROM nvcr.io/nvidia/pytorch:24.10-py3
+# 25.11 ships with CUDA 13.0.2, matching the maximum supported by driver 580.
+# Upgrade this tag when the host driver is updated (25.12+ requires CUDA 13.1+).
+FROM nvcr.io/nvidia/pytorch:25.11-py3
 
 # Install Rust (required to compile the lancedb extension).
 # Rust is only needed at build time; the compiled .so is what ships in the image.
