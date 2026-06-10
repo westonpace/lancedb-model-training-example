@@ -31,6 +31,7 @@ RUN mkdir -p lancedb/nodejs/src && touch lancedb/nodejs/src/lib.rs
 
 # Copy the entire python directory (maturin requires the Python source present
 # when building the wheel so it can bundle it alongside the compiled extension).
+COPY lancedb/LICENSE lancedb/
 COPY lancedb/python/ lancedb/python/
 
 # Compile the Rust extension and install the resulting wheel.
@@ -45,7 +46,7 @@ COPY lancedb/python/ lancedb/python/
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/cargo-target \
-    CARGO_TARGET_DIR=/cargo-target \
+    export CARGO_TARGET_DIR=/cargo-target && \
     cd lancedb/python && \
     maturin build --release --out /tmp/wheels && \
     pip install /tmp/wheels/*.whl && \
