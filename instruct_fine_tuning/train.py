@@ -98,6 +98,14 @@ def _parse_uri(uri: str):
     return base, prefix
 
 
+def _make_store(base: str) -> ObjectStore:
+    options = {}
+    region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION")
+    if region:
+        options["aws_region"] = region
+    return ObjectStore(base, options=options) if options else ObjectStore(base)
+
+
 def save_checkpoint(store: ObjectStore, prefix: str, name: str, obj) -> None:
     buf = io.BytesIO()
     torch.save(obj, buf)
@@ -176,7 +184,7 @@ def main():
         sys.exit(1)
 
     checkpoint_store_base, checkpoint_prefix = _parse_uri(checkpoint_uri)
-    checkpoint_store = ObjectStore(checkpoint_store_base)
+    checkpoint_store = _make_store(checkpoint_store_base)
 
     if is_main:
         logging.info(f"World size: {world_size}")
