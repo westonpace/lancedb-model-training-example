@@ -17,7 +17,8 @@ RUN pip install --no-cache-dir \
     accelerate \
     datasets \
     pyarrow \
-    object-store-python
+    object-store-python \
+    "torchao>=0.16.0"
 
 WORKDIR /workspace
 
