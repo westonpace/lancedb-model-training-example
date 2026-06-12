@@ -13,12 +13,11 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 RUN pip install --no-cache-dir \
     maturin \
     transformers \
-    peft \
+    "peft==0.13.2" \
     accelerate \
     datasets \
     pyarrow \
-    object-store-python \
-    "torchao>=0.16.0"
+    object-store-python
 
 WORKDIR /workspace
 
