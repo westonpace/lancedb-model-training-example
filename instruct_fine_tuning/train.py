@@ -158,14 +158,21 @@ def make_collate_fn(tokenizer):
 # ── Prefetch ──────────────────────────────────────────────────────────────────
 
 class PrefetchLoader:
-    """Wraps a DataLoader to prefetch and move batches to device on a background thread."""
+    """Wraps a DataLoader to prefetch and move batches to device on a background thread.
+
+    Attributes:
+        queue_depth: depth of the prefetch queue at the last batch yield.
+            Near num_prefetch → I/O is keeping up; near 0 → GPU is starved.
+        num_prefetch: maximum queue depth (capacity).
+    """
     def __init__(self, loader, device, num_prefetch=2):
         self._loader = loader
         self._device = device
-        self._num_prefetch = num_prefetch
+        self.num_prefetch = num_prefetch
+        self.queue_depth = 0
 
     def __iter__(self):
-        q = queue.Queue(maxsize=self._num_prefetch)
+        q = queue.Queue(maxsize=self.num_prefetch)
 
         def fill():
             for batch in self._loader:
@@ -178,6 +185,7 @@ class PrefetchLoader:
             batch = q.get()
             if batch is None:
                 break
+            self.queue_depth = q.qsize()
             yield batch
         t.join()
 
@@ -279,6 +287,7 @@ def main():
         epoch_loss = 0.0
         epoch_steps = 0
         epoch_tokens = 0
+        interval_queue_depth = 0.0
 
         for step, batch in enumerate(dataloader):
             input_ids = batch["input_ids"]
@@ -299,16 +308,20 @@ def main():
             epoch_loss += loss.item()
             epoch_steps += 1
             total_steps += 1
+            interval_queue_depth += dataloader.queue_depth
 
             if is_main and total_steps % LOG_INTERVAL == 0:
                 elapsed = time.perf_counter() - training_start
                 tok_per_sec = total_tokens / elapsed
+                avg_depth = interval_queue_depth / LOG_INTERVAL
                 logging.info(
                     f"epoch {epoch + 1:3d}/{NUM_EPOCHS} "
                     f"step {step + 1:5d} | "
                     f"loss {loss.item():.4f} | "
-                    f"{tok_per_sec:,.0f} tok/s"
+                    f"{tok_per_sec:,.0f} tok/s | "
+                    f"prefetch {avg_depth:.1f}/{dataloader.num_prefetch}"
                 )
+                interval_queue_depth = 0.0
 
         epoch_time = time.perf_counter() - epoch_start
         if is_main:
