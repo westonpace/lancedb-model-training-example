@@ -23,8 +23,10 @@ Single GPU:
 
 import io
 import os
+import queue
 import sys
 import logging
+import threading
 import time
 import tempfile
 from urllib.parse import urlparse
@@ -153,6 +155,33 @@ def make_collate_fn(tokenizer):
     return collate_fn
 
 
+# ── Prefetch ──────────────────────────────────────────────────────────────────
+
+class PrefetchLoader:
+    """Wraps a DataLoader to prefetch and move batches to device on a background thread."""
+    def __init__(self, loader, device, num_prefetch=2):
+        self._loader = loader
+        self._device = device
+        self._num_prefetch = num_prefetch
+
+    def __iter__(self):
+        q = queue.Queue(maxsize=self._num_prefetch)
+
+        def fill():
+            for batch in self._loader:
+                q.put({k: v.to(self._device, non_blocking=True) for k, v in batch.items()})
+            q.put(None)
+
+        t = threading.Thread(target=fill, daemon=True)
+        t.start()
+        while True:
+            batch = q.get()
+            if batch is None:
+                break
+            yield batch
+        t.join()
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -235,12 +264,15 @@ def main():
             rank=rank,
             world_size=world_size,
         )
-        dataloader = DataLoader(
-            dataset,
-            batch_size=BATCH_SIZE,
-            collate_fn=collate_fn,
-            num_workers=NUM_WORKERS,
-            multiprocessing_context="forkserver" if NUM_WORKERS > 0 else None,
+        dataloader = PrefetchLoader(
+            DataLoader(
+                dataset,
+                batch_size=BATCH_SIZE,
+                collate_fn=collate_fn,
+                num_workers=NUM_WORKERS,
+                multiprocessing_context="forkserver" if NUM_WORKERS > 0 else None,
+            ),
+            device,
         )
 
         model.train()
@@ -249,9 +281,9 @@ def main():
         epoch_tokens = 0
 
         for step, batch in enumerate(dataloader):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
+            input_ids = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
+            labels = batch["labels"]
 
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             loss = outputs.loss
