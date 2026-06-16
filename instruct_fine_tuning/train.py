@@ -170,6 +170,7 @@ class PrefetchLoader:
         self._device = device
         self.num_prefetch = num_prefetch
         self.queue_depth = 0
+        self.last_fetch_s = 0.0
 
     def __iter__(self):
         q = queue.Queue(maxsize=self.num_prefetch)
@@ -182,7 +183,9 @@ class PrefetchLoader:
         t = threading.Thread(target=fill, daemon=True)
         t.start()
         while True:
+            t0 = time.perf_counter()
             batch = q.get()
+            self.last_fetch_s = time.perf_counter() - t0
             if batch is None:
                 break
             self.queue_depth = q.qsize()
@@ -288,6 +291,7 @@ def main():
         epoch_steps = 0
         epoch_tokens = 0
         interval_queue_depth = 0.0
+        interval_fetch_s = 0.0
 
         for step, batch in enumerate(dataloader):
             input_ids = batch["input_ids"]
@@ -309,19 +313,23 @@ def main():
             epoch_steps += 1
             total_steps += 1
             interval_queue_depth += dataloader.queue_depth
+            interval_fetch_s += dataloader.last_fetch_s
 
             if is_main and total_steps % LOG_INTERVAL == 0:
                 elapsed = time.perf_counter() - training_start
                 tok_per_sec = total_tokens / elapsed
                 avg_depth = interval_queue_depth / LOG_INTERVAL
+                avg_fetch_ms = interval_fetch_s / LOG_INTERVAL * 1000
                 logging.info(
                     f"epoch {epoch + 1:3d}/{NUM_EPOCHS} "
                     f"step {step + 1:5d} | "
                     f"loss {loss.item():.4f} | "
                     f"{tok_per_sec:,.0f} tok/s | "
-                    f"prefetch {avg_depth:.1f}/{dataloader.num_prefetch}"
+                    f"prefetch {avg_depth:.1f}/{dataloader.num_prefetch} | "
+                    f"fetch {avg_fetch_ms:.1f}ms"
                 )
                 interval_queue_depth = 0.0
+                interval_fetch_s = 0.0
 
         epoch_time = time.perf_counter() - epoch_start
         if is_main:
