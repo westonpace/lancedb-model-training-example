@@ -240,6 +240,7 @@ def main():
             batch_size=BATCH_SIZE,
             collate_fn=collate_fn,
             num_workers=NUM_WORKERS,
+            multiprocessing_context="forkserver" if NUM_WORKERS > 0 else None,
         )
 
         model.train()
@@ -315,4 +316,6 @@ def main():
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.set_start_method("forkserver")
     main()
