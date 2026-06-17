@@ -13,6 +13,7 @@ load data into LanceDB and a training script that reads from it using
 | Directory | Description |
 |-----------|-------------|
 | [`instruct_fine_tuning/`](instruct_fine_tuning/) | Fine-tune a causal LM on the Alpaca instruction-following dataset |
+| [`resnet_benchmark/`](resnet_benchmark/) | Benchmark ResNet-50 training throughput to stress-test the data loader |
 
 ## What is the Lance dataloader?
 
