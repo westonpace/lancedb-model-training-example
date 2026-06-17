@@ -142,7 +142,7 @@ def make_collate_fn(tokenizer):
             texts,
             max_length=MAX_LENGTH,
             truncation=True,
-            padding="max_length",
+            padding=True,
             return_tensors="pt",
         )
         labels = encoded["input_ids"].clone()
