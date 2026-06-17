@@ -26,10 +26,8 @@ Single GPU:
 
 import io
 import os
-import queue
 import sys
 import logging
-import threading
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lancedb", "python", "python"))
@@ -51,6 +49,10 @@ NUM_WORKERS  = 0
 BATCH_SIZE   = 64
 SHUFFLE_SEED = 42
 LOG_INTERVAL = 20     # log every N steps
+
+# StreamingDataset I/O tuning
+READ_BATCH_SIZE  = 64   # Rows fetched per split per take_offsets call.
+PREFETCH_BATCHES = 4    # Concurrent read_batch_size fetches in flight per split.
 
 
 # ── Transforms ─────────────────────────────────────────────────────────────────
@@ -78,50 +80,6 @@ def setup_distributed():
 def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
-
-
-# ── Prefetch loader ────────────────────────────────────────────────────────────
-
-class PrefetchLoader:
-    """Wraps a DataLoader to prefetch and move batches to device on a background
-    thread, overlapping data loading with GPU compute.
-
-    Attributes:
-        queue_depth:   depth of the prefetch queue at the last batch yield.
-        last_fetch_s:  seconds the training loop blocked waiting on the queue.
-        num_prefetch:  maximum queue depth (capacity).
-    """
-
-    def __init__(self, loader, device, num_prefetch=2):
-        self._loader = loader
-        self._device = device
-        self.num_prefetch = num_prefetch
-        self.queue_depth = 0
-        self.last_fetch_s = 0.0
-
-    def __iter__(self):
-        q = queue.Queue(maxsize=self.num_prefetch)
-
-        def fill():
-            for batch in self._loader:
-                images, labels = batch
-                q.put((
-                    images.to(self._device, non_blocking=True),
-                    labels.to(self._device, non_blocking=True),
-                ))
-            q.put(None)
-
-        t = threading.Thread(target=fill, daemon=True)
-        t.start()
-        while True:
-            t0 = time.perf_counter()
-            batch = q.get()
-            self.last_fetch_s = time.perf_counter() - t0
-            if batch is None:
-                break
-            self.queue_depth = q.qsize()
-            yield batch
-        t.join()
 
 
 # ── Collate ────────────────────────────────────────────────────────────────────
@@ -193,26 +151,26 @@ def main():
             epoch=epoch,
             rank=rank,
             world_size=world_size,
+            read_batch_size=READ_BATCH_SIZE,
+            prefetch_batches=PREFETCH_BATCHES,
         )
-        dataloader = PrefetchLoader(
-            DataLoader(
-                dataset,
-                batch_size=BATCH_SIZE,
-                collate_fn=collate_fn,
-                num_workers=NUM_WORKERS,
-                multiprocessing_context="forkserver" if NUM_WORKERS > 0 else None,
-            ),
-            device,
+        dataloader = DataLoader(
+            dataset,
+            batch_size=BATCH_SIZE,
+            collate_fn=collate_fn,
+            num_workers=NUM_WORKERS,
+            multiprocessing_context="forkserver" if NUM_WORKERS > 0 else None,
         )
 
         model.train()
-        interval_images       = 0
-        interval_gpu_ms       = 0.0
-        interval_fetch_ms     = 0.0
-        interval_queue_depth  = 0.0
-        interval_start        = time.perf_counter()
+        interval_images  = 0
+        interval_gpu_ms  = 0.0
+        interval_start   = time.perf_counter()
 
         for step, (images, labels) in enumerate(dataloader):
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
             start_event.record()
             outputs = model(images)
             loss = criterion(outputs, labels)
@@ -225,20 +183,16 @@ def main():
             gpu_ms = start_event.elapsed_time(end_event)
             batch_n = images.shape[0]
 
-            interval_images      += batch_n
-            total_images         += batch_n
-            total_steps          += 1
-            interval_gpu_ms      += gpu_ms
-            interval_fetch_ms    += dataloader.last_fetch_s * 1000
-            interval_queue_depth += dataloader.queue_depth
+            interval_images += batch_n
+            total_images    += batch_n
+            total_steps     += 1
+            interval_gpu_ms += gpu_ms
 
             if is_main and (total_steps % LOG_INTERVAL == 0):
-                elapsed       = time.perf_counter() - interval_start
-                img_per_sec   = interval_images / elapsed
-                avg_gpu_ms    = interval_gpu_ms / LOG_INTERVAL
-                avg_fetch_ms  = interval_fetch_ms / LOG_INTERVAL
-                avg_data_ms   = elapsed * 1000 / LOG_INTERVAL - avg_gpu_ms
-                avg_depth     = interval_queue_depth / LOG_INTERVAL
+                elapsed     = time.perf_counter() - interval_start
+                img_per_sec = interval_images / elapsed
+                avg_gpu_ms  = interval_gpu_ms / LOG_INTERVAL
+                avg_data_ms = elapsed * 1000 / LOG_INTERVAL - avg_gpu_ms
 
                 logging.info(
                     f"epoch {epoch + 1}/{NUM_EPOCHS} "
@@ -246,15 +200,11 @@ def main():
                     f"loss {loss.item():.4f} | "
                     f"{img_per_sec:,.0f} img/s | "
                     f"gpu {avg_gpu_ms:.1f}ms | "
-                    f"data {avg_data_ms:.1f}ms | "
-                    f"fetch {avg_fetch_ms:.1f}ms | "
-                    f"prefetch {avg_depth:.1f}/{dataloader.num_prefetch}"
+                    f"data {avg_data_ms:.1f}ms"
                 )
-                interval_images      = 0
-                interval_gpu_ms      = 0.0
-                interval_fetch_ms    = 0.0
-                interval_queue_depth = 0.0
-                interval_start       = time.perf_counter()
+                interval_images  = 0
+                interval_gpu_ms  = 0.0
+                interval_start   = time.perf_counter()
 
         epoch_time = time.perf_counter() - epoch_start
         if is_main:

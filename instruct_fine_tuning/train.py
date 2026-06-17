@@ -23,10 +23,8 @@ Single GPU:
 
 import io
 import os
-import queue
 import sys
 import logging
-import threading
 import time
 import tempfile
 from urllib.parse import urlparse
@@ -61,6 +59,10 @@ MAX_LENGTH = 512      # Truncate sequences to this many tokens.
 SHUFFLE_SEED = 42
 LEARNING_RATE = 2e-4
 LOG_INTERVAL = 50     # Log throughput every N steps.
+
+# StreamingDataset I/O tuning
+READ_BATCH_SIZE  = 64   # Rows fetched per split per take_offsets call.
+PREFETCH_BATCHES = 4    # Concurrent read_batch_size fetches in flight per split.
 
 # LoRA
 LORA_R = 16
@@ -155,44 +157,6 @@ def make_collate_fn(tokenizer):
     return collate_fn
 
 
-# ── Prefetch ──────────────────────────────────────────────────────────────────
-
-class PrefetchLoader:
-    """Wraps a DataLoader to prefetch and move batches to device on a background thread.
-
-    Attributes:
-        queue_depth: depth of the prefetch queue at the last batch yield.
-            Near num_prefetch → I/O is keeping up; near 0 → GPU is starved.
-        num_prefetch: maximum queue depth (capacity).
-    """
-    def __init__(self, loader, device, num_prefetch=2):
-        self._loader = loader
-        self._device = device
-        self.num_prefetch = num_prefetch
-        self.queue_depth = 0
-        self.last_fetch_s = 0.0
-
-    def __iter__(self):
-        q = queue.Queue(maxsize=self.num_prefetch)
-
-        def fill():
-            for batch in self._loader:
-                q.put({k: v.to(self._device, non_blocking=True) for k, v in batch.items()})
-            q.put(None)
-
-        t = threading.Thread(target=fill, daemon=True)
-        t.start()
-        while True:
-            t0 = time.perf_counter()
-            batch = q.get()
-            self.last_fetch_s = time.perf_counter() - t0
-            if batch is None:
-                break
-            self.queue_depth = q.qsize()
-            yield batch
-        t.join()
-
-
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -275,16 +239,15 @@ def main():
             epoch=epoch,
             rank=rank,
             world_size=world_size,
+            read_batch_size=READ_BATCH_SIZE,
+            prefetch_batches=PREFETCH_BATCHES,
         )
-        dataloader = PrefetchLoader(
-            DataLoader(
-                dataset,
-                batch_size=BATCH_SIZE,
-                collate_fn=collate_fn,
-                num_workers=NUM_WORKERS,
-                multiprocessing_context="forkserver" if NUM_WORKERS > 0 else None,
-            ),
-            device,
+        dataloader = DataLoader(
+            dataset,
+            batch_size=BATCH_SIZE,
+            collate_fn=collate_fn,
+            num_workers=NUM_WORKERS,
+            multiprocessing_context="forkserver" if NUM_WORKERS > 0 else None,
         )
 
         model.train()
@@ -292,13 +255,11 @@ def main():
         epoch_steps = 0
         epoch_tokens = 0
         epoch_rows = 0
-        interval_queue_depth = 0.0
-        interval_fetch_s = 0.0
 
         for step, batch in enumerate(dataloader):
-            input_ids = batch["input_ids"]
-            attention_mask = batch["attention_mask"]
-            labels = batch["labels"]
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            labels = batch["labels"].to(device, non_blocking=True)
 
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             loss = outputs.loss
@@ -316,26 +277,18 @@ def main():
             epoch_loss += loss.item()
             epoch_steps += 1
             total_steps += 1
-            interval_queue_depth += dataloader.queue_depth
-            interval_fetch_s += dataloader.last_fetch_s
 
             if is_main and total_steps % LOG_INTERVAL == 0:
                 elapsed = time.perf_counter() - training_start
                 tok_per_sec = total_tokens / elapsed
-                rows_per_sec = (epoch_rows / (time.perf_counter() - epoch_start))
-                avg_depth = interval_queue_depth / LOG_INTERVAL
-                avg_fetch_ms = interval_fetch_s / LOG_INTERVAL * 1000
+                rows_per_sec = epoch_rows / (time.perf_counter() - epoch_start)
                 logging.info(
                     f"epoch {epoch + 1:3d}/{NUM_EPOCHS} "
                     f"step {step + 1:5d} | "
                     f"loss {loss.item():.4f} | "
                     f"{tok_per_sec:,.0f} tok/s | "
-                    f"{rows_per_sec:,.0f} rows/s | "
-                    f"prefetch {avg_depth:.1f}/{dataloader.num_prefetch} | "
-                    f"fetch {avg_fetch_ms:.1f}ms"
+                    f"{rows_per_sec:,.0f} rows/s"
                 )
-                interval_queue_depth = 0.0
-                interval_fetch_s = 0.0
 
         epoch_time = time.perf_counter() - epoch_start
         if is_main:
