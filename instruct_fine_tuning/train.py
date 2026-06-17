@@ -248,6 +248,7 @@ def main():
     model = model.to(device)
     if world_size > 1:
         model = DDP(model, device_ids=[rank], find_unused_parameters=False)
+    model = torch.compile(model, dynamic=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
