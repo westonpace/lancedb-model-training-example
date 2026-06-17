@@ -291,6 +291,7 @@ def main():
         epoch_loss = 0.0
         epoch_steps = 0
         epoch_tokens = 0
+        epoch_rows = 0
         interval_queue_depth = 0.0
         interval_fetch_s = 0.0
 
@@ -307,7 +308,9 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
+            batch_rows = input_ids.shape[0]
             batch_tokens = int(attention_mask.sum())
+            epoch_rows += batch_rows
             epoch_tokens += batch_tokens
             total_tokens += batch_tokens
             epoch_loss += loss.item()
@@ -319,6 +322,7 @@ def main():
             if is_main and total_steps % LOG_INTERVAL == 0:
                 elapsed = time.perf_counter() - training_start
                 tok_per_sec = total_tokens / elapsed
+                rows_per_sec = (epoch_rows / (time.perf_counter() - epoch_start))
                 avg_depth = interval_queue_depth / LOG_INTERVAL
                 avg_fetch_ms = interval_fetch_s / LOG_INTERVAL * 1000
                 logging.info(
@@ -326,6 +330,7 @@ def main():
                     f"step {step + 1:5d} | "
                     f"loss {loss.item():.4f} | "
                     f"{tok_per_sec:,.0f} tok/s | "
+                    f"{rows_per_sec:,.0f} rows/s | "
                     f"prefetch {avg_depth:.1f}/{dataloader.num_prefetch} | "
                     f"fetch {avg_fetch_ms:.1f}ms"
                 )
