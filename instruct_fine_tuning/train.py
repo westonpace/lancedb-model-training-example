@@ -329,5 +329,9 @@ def main():
 
 if __name__ == "__main__":
     import multiprocessing
+    import resource
     multiprocessing.set_start_method("forkserver")
+    # torch.compile opens many files while tracing; raise the fd limit to avoid EMFILE.
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(65536, hard), hard))
     main()
