@@ -29,7 +29,7 @@ import time
 import tempfile
 from urllib.parse import urlparse
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lancedb", "python", "python"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lancedb", "python", "python"))
 
 import torch
 import torch.distributed as dist

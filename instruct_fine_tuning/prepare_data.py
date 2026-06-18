@@ -14,7 +14,7 @@ import sys
 
 # Use lancedb from the submodule (requires the Rust extension to be built:
 #   cd lancedb/python && maturin develop --release)
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lancedb", "python", "python"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lancedb", "python", "python"))
 
 import pyarrow as pa
 import lancedb
