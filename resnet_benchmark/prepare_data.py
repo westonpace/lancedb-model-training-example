@@ -63,7 +63,7 @@ def main():
     generated = 0
 
     print(f"Generating {NUM_IMAGES:,} synthetic {IMAGE_SIZE[0]}x{IMAGE_SIZE[1]} "
-          f"JPEG images (quality={JPEG_QUALITY})...")
+          f"JPEG images (quality={JPEG_QUALITY})...", flush=True)
 
     while generated < NUM_IMAGES:
         batch_n = min(BATCH_SIZE, NUM_IMAGES - generated)
@@ -82,9 +82,9 @@ def main():
 
         generated += batch_n
         avg_kb = sum(len(b) for b in images) / len(images) / 1024
-        print(f"  {generated:>8,} / {NUM_IMAGES:,}  avg image size: {avg_kb:.1f} KB")
+        print(f"  {generated:>8,} / {NUM_IMAGES:,}  avg image size: {avg_kb:.1f} KB", flush=True)
 
-    print(f"\nDone. {len(table):,} rows in '{lancedb_uri}/{TABLE_NAME}'")
+    print(f"\nDone. {len(table):,} rows in '{lancedb_uri}/{TABLE_NAME}'", flush=True)
     print(f"Schema: {table.schema}")
 
 
