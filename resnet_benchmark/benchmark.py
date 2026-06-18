@@ -7,12 +7,18 @@ enough on a modern GPU that it is easily I/O bound when reading images from
 cloud storage, making data pipeline efficiency the dominant variable.
 
 Each log line breaks down time into:
-  - data_ms:  time spent fetching + decoding images (CPU-side)
-  - gpu_ms:   time spent on forward + backward pass (GPU-side)
-  - img/s:    images processed per second (wall-clock)
+  - img/s:      images processed per second (wall-clock)
+  - gpu_ms:     time spent on forward + backward pass (GPU-side)
+  - data_ms:    wall-clock time per step minus gpu_ms (CPU/IO-side)
+  - prefetch:   number of read batches currently in-flight in LanceDB
+  - MB/s:       raw bytes fetched from storage per second
+  - fetch_ms:   avg time per step waiting for LanceDB I/O
+  - xform_ms:   avg time per step for Arrow→Python conversion
 
 When data_ms >> gpu_ms the pipeline is I/O bound.
 When gpu_ms >> data_ms the GPU is the bottleneck.
+When fetch_ms dominates data_ms, S3 latency/bandwidth is the limit.
+When xform_ms or collate (JPEG decode) dominates, CPU is the limit.
 
 Required environment variables:
     LANCEDB_URI      URI of the LanceDB database (e.g. s3://my-bucket/data)
@@ -163,9 +169,12 @@ def main():
         )
 
         model.train()
-        interval_images  = 0
-        interval_gpu_ms  = 0.0
-        interval_start   = time.perf_counter()
+        interval_images    = 0
+        interval_gpu_ms    = 0.0
+        interval_start     = time.perf_counter()
+        prev_bytes_loaded  = dataset.bytes_loaded
+        prev_fetch_time    = dataset.fetch_time
+        prev_transform_time = dataset.transform_time
 
         for step, (images, labels) in enumerate(dataloader):
             images = images.to(device, non_blocking=True)
@@ -194,17 +203,30 @@ def main():
                 avg_gpu_ms  = interval_gpu_ms / LOG_INTERVAL
                 avg_data_ms = elapsed * 1000 / LOG_INTERVAL - avg_gpu_ms
 
+                interval_mb    = (dataset.bytes_loaded - prev_bytes_loaded) / 1e6
+                mb_per_sec     = interval_mb / elapsed if elapsed > 0 else 0.0
+                avg_fetch_ms   = (dataset.fetch_time - prev_fetch_time) * 1000 / LOG_INTERVAL
+                avg_xform_ms   = (dataset.transform_time - prev_transform_time) * 1000 / LOG_INTERVAL
+                queue_depth    = dataset.prefetch_queue_depth
+
                 logging.info(
                     f"epoch {epoch + 1}/{NUM_EPOCHS} "
                     f"step {step + 1:5d} | "
                     f"loss {loss.item():.4f} | "
                     f"{img_per_sec:,.0f} img/s | "
                     f"gpu {avg_gpu_ms:.1f}ms | "
-                    f"data {avg_data_ms:.1f}ms"
+                    f"data {avg_data_ms:.1f}ms | "
+                    f"prefetch {queue_depth} | "
+                    f"{mb_per_sec:.1f} MB/s | "
+                    f"fetch {avg_fetch_ms:.1f}ms | "
+                    f"xform {avg_xform_ms:.1f}ms"
                 )
-                interval_images  = 0
-                interval_gpu_ms  = 0.0
-                interval_start   = time.perf_counter()
+                interval_images     = 0
+                interval_gpu_ms     = 0.0
+                interval_start      = time.perf_counter()
+                prev_bytes_loaded   = dataset.bytes_loaded
+                prev_fetch_time     = dataset.fetch_time
+                prev_transform_time = dataset.transform_time
 
         epoch_time = time.perf_counter() - epoch_start
         if is_main:
