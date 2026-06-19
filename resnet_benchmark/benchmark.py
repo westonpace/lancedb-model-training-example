@@ -50,7 +50,7 @@ from lancedb.streaming import StreamingDataset
 TABLE_NAME   = "resnet_images"
 NUM_EPOCHS   = 5
 NUM_SPLITS   = 64
-NUM_WORKERS  = 0
+NUM_WORKERS  = 1
 BATCH_SIZE   = 64
 SHUFFLE_SEED = 42
 LOG_INTERVAL = 20     # log every N steps
