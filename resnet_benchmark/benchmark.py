@@ -49,15 +49,15 @@ from lancedb.streaming import StreamingDataset
 # ── Configuration ──────────────────────────────────────────────────────────────
 TABLE_NAME   = "resnet_images"
 NUM_EPOCHS   = 5
-NUM_SPLITS   = 64
-NUM_WORKERS  = 1
-BATCH_SIZE   = 64
+NUM_SPLITS   = int(os.environ.get("NUM_SPLITS",   8))
+NUM_WORKERS  = int(os.environ.get("NUM_WORKERS",  1))
+BATCH_SIZE   = int(os.environ.get("BATCH_SIZE",  64))
 SHUFFLE_SEED = 42
 LOG_INTERVAL = 20     # log every N steps
 
 # StreamingDataset I/O tuning
-READ_BATCH_SIZE  = 64   # Rows fetched per split per take_offsets call.
-PREFETCH_BATCHES = 4    # Concurrent read_batch_size fetches in flight per split.
+READ_BATCH_SIZE  = int(os.environ.get("READ_BATCH_SIZE",  64))  # Rows fetched per split per take_offsets call.
+PREFETCH_BATCHES = int(os.environ.get("PREFETCH_BATCHES",  1))  # Concurrent read_batch_size fetches in flight per split.
 
 
 # ── Transforms ─────────────────────────────────────────────────────────────────
