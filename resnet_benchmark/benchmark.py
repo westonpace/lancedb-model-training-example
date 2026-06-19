@@ -13,12 +13,12 @@ Each log line breaks down time into:
   - prefetch:   number of read batches currently in-flight in LanceDB
   - MB/s:       raw bytes fetched from storage per second
   - fetch_ms:   avg time per step waiting for LanceDB I/O
-  - xform_ms:   avg time per step for Arrow→Python conversion
+  - xform_ms:   avg time per step for JPEG decode + image transforms
 
 When data_ms >> gpu_ms the pipeline is I/O bound.
 When gpu_ms >> data_ms the GPU is the bottleneck.
 When fetch_ms dominates data_ms, S3 latency/bandwidth is the limit.
-When xform_ms or collate (JPEG decode) dominates, CPU is the limit.
+When xform_ms dominates data_ms, JPEG decode / image transforms are the limit.
 
 Required environment variables:
     LANCEDB_URI      URI of the LanceDB database (e.g. s3://my-bucket/data)
@@ -30,7 +30,6 @@ Single GPU:
     torchrun --nproc_per_node=8 benchmark.py
 """
 
-import io
 import os
 import sys
 import logging
@@ -43,7 +42,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torchvision import models, transforms
-from PIL import Image
+from torchvision.io import decode_jpeg
 import lancedb
 from lancedb.streaming import StreamingDataset
 
@@ -66,7 +65,7 @@ PREFETCH_BATCHES = 4    # Concurrent read_batch_size fetches in flight per split
 _train_transform = transforms.Compose([
     transforms.RandomResizedCrop(224),
     transforms.RandomHorizontalFlip(),
-    transforms.ToTensor(),
+    transforms.ConvertImageDtype(torch.float32),
     transforms.Normalize(mean=[0.485, 0.456, 0.406],
                          std=[0.229, 0.224, 0.225]),
 ])
@@ -96,7 +95,8 @@ def decode_transform(batch):
     label_col = batch.column("label")
     rows = []
     for i in range(len(batch)):
-        img = Image.open(io.BytesIO(image_col[i].as_py())).convert("RGB")
+        encoded = torch.frombuffer(image_col[i].as_py(), dtype=torch.uint8)
+        img = decode_jpeg(encoded)  # releases GIL; returns uint8 (3, H, W) tensor
         rows.append({"image": _train_transform(img), "label": label_col[i].as_py()})
     return rows
 
