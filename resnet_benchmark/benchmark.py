@@ -88,16 +88,24 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-# ── Collate ────────────────────────────────────────────────────────────────────
+# ── Transform / Collate ────────────────────────────────────────────────────────
+
+def decode_transform(batch):
+    """Decode JPEG and apply image transforms in the background prefetch thread."""
+    image_col = batch.column("image")
+    label_col = batch.column("label")
+    rows = []
+    for i in range(len(batch)):
+        img = Image.open(io.BytesIO(image_col[i].as_py())).convert("RGB")
+        rows.append({"image": _train_transform(img), "label": label_col[i].as_py()})
+    return rows
+
 
 def collate_fn(rows):
-    images = []
-    labels = []
-    for row in rows:
-        img = Image.open(io.BytesIO(row["image"])).convert("RGB")
-        images.append(_train_transform(img))
-        labels.append(row["label"])
-    return torch.stack(images), torch.tensor(labels, dtype=torch.long)
+    return (
+        torch.stack([row["image"] for row in rows]),
+        torch.tensor([row["label"] for row in rows], dtype=torch.long),
+    )
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -159,6 +167,7 @@ def main():
             world_size=world_size,
             read_batch_size=READ_BATCH_SIZE,
             prefetch_batches=PREFETCH_BATCHES,
+            transform=decode_transform,
         )
         dataloader = DataLoader(
             dataset,
