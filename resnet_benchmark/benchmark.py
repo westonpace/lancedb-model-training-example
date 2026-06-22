@@ -51,7 +51,7 @@ TABLE_NAME   = "resnet_images"
 NUM_EPOCHS   = 5
 NUM_SPLITS   = int(os.environ.get("NUM_SPLITS",   8))
 NUM_WORKERS  = int(os.environ.get("NUM_WORKERS",  1))
-BATCH_SIZE   = int(os.environ.get("BATCH_SIZE",  64))
+BATCH_SIZE   = int(os.environ.get("BATCH_SIZE", 256))
 SHUFFLE_SEED = 42
 LOG_INTERVAL = 20     # log every N steps
 
@@ -190,8 +190,9 @@ def main():
             labels = labels.to(device, non_blocking=True)
 
             start_event.record()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                outputs = model(images)
+                loss = criterion(outputs, labels)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
