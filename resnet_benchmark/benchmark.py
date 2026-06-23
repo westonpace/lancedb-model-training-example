@@ -51,7 +51,7 @@ TABLE_NAME   = "resnet_images"
 NUM_EPOCHS   = 5
 NUM_SPLITS   = int(os.environ.get("NUM_SPLITS",   8))
 NUM_WORKERS  = int(os.environ.get("NUM_WORKERS",  1))
-BATCH_SIZE   = int(os.environ.get("BATCH_SIZE", 256))
+BATCH_SIZE   = int(os.environ.get("BATCH_SIZE", 512))
 SHUFFLE_SEED = 42
 LOG_INTERVAL = 20     # log every N steps
 
@@ -127,7 +127,7 @@ def main():
 
     # ── Model ──────────────────────────────────────────────────────────────────
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
-    model = models.resnet50(weights=None).to(device)
+    model = models.resnet50(weights=None).to(device, dtype=torch.bfloat16)
     model = torch.compile(model, dynamic=True)
     if world_size > 1:
         model = DDP(model, device_ids=[rank])
@@ -186,13 +186,12 @@ def main():
         prev_transform_time = dataset.transform_time
 
         for step, (images, labels) in enumerate(dataloader):
-            images = images.to(device, non_blocking=True)
+            images = images.to(device, dtype=torch.bfloat16, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
             start_event.record()
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                outputs = model(images)
-                loss = criterion(outputs, labels)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
