@@ -10,7 +10,7 @@ Each log line breaks down time into:
   - img/s:      images processed per second (wall-clock)
   - gpu_ms:     time spent on forward + backward pass (GPU-side)
   - data_ms:    wall-clock time per step minus gpu_ms (CPU/IO-side)
-  - raw:        fetched RecordBatches waiting for a transform thread (stage 1→2 queue)
+  - raw:        decoded rows waiting for a transform thread (stage 1→2 queue)
   - cooked:     transformed rows ready to yield to the DataLoader (stage 2→3 queue)
   - MB/s:       raw bytes fetched from storage per second
   - fetch_ms:   avg time per step waiting for LanceDB I/O
