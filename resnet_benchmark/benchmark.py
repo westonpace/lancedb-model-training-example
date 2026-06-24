@@ -53,8 +53,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torchvision import models, transforms
 from torchvision.io import decode_jpeg
+import functools
 import lancedb
 from lancedb.streaming import StreamingDataset
+
+
+def _open_table(uri: str, table_name: str):
+    """Module-level factory so it survives pickling into DataLoader workers."""
+    return lancedb.connect(uri).open_table(table_name)
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 TABLE_NAME   = "resnet_images"
@@ -179,6 +185,7 @@ def main():
             read_batch_size=READ_BATCH_SIZE,
             prefetch_batches=PREFETCH_BATCHES,
             transform=decode_transform,
+            connection_factory=functools.partial(_open_table, lancedb_uri),
         )
         dataloader = DataLoader(
             dataset,
