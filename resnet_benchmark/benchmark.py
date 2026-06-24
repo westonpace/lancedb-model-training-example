@@ -10,13 +10,10 @@ Each log line breaks down time into:
   - img/s:      images processed per second (wall-clock)
   - gpu_ms:     time spent on forward + backward pass (GPU-side)
   - data_ms:    wall-clock time per step minus gpu_ms (CPU/IO-side)
-  - unscanned:  rows not yet submitted to the I/O stage
-  - raw:        fetched rows waiting for a transform thread (stage 1→2 queue)
-  - cooked:     transformed rows ready to yield to the DataLoader (stage 2→3 queue)
-  - complete:   rows already yielded to the DataLoader
+  - u/r/c/d:    pipeline row counts: unscanned / raw / cooked / done
   - MB/s:       raw bytes fetched from storage per second
-  - fetch_ms:   avg time per step waiting for LanceDB I/O
-  - xform_ms:   avg time per step for JPEG decode + image transforms
+  - ld:         avg time per step waiting for LanceDB I/O (load)
+  - xf:         avg time per step for JPEG decode + image transforms
   - cpu%:       system CPU utilization averaged over the log interval
   - vram%:      GPU VRAM in use as a percentage of total device memory
 
@@ -248,10 +245,10 @@ def main():
                     f"{img_per_sec:,.0f} img/s | "
                     f"gpu {avg_gpu_ms:.1f}ms | "
                     f"data {avg_data_ms:.1f}ms | "
-                    f"unscanned {unscanned} raw {raw_depth} cooked {cooked_depth} complete {complete} | "
+                    f"{unscanned}/{raw_depth}/{cooked_depth}/{complete} | "
                     f"{mb_per_sec:.1f} MB/s | "
-                    f"fetch {avg_fetch_ms:.1f}ms | "
-                    f"xform {avg_xform_ms:.1f}ms | "
+                    f"ld {avg_fetch_ms:.1f}ms | "
+                    f"xf {avg_xform_ms:.1f}ms | "
                     f"cpu {cpu_str} vram {vram_str}"
                 )
                 interval_images     = 0
