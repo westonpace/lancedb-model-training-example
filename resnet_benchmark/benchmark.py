@@ -111,7 +111,7 @@ def decode_transform(batch):
     label_col = batch.column("label")
     rows = []
     for i in range(len(batch)):
-        encoded = torch.frombuffer(image_col[i].as_py(), dtype=torch.uint8)
+        encoded = torch.frombuffer(bytearray(image_col[i].as_py()), dtype=torch.uint8)
         img = decode_jpeg(encoded)  # releases GIL; returns uint8 (3, H, W) tensor
         rows.append({"image": _train_transform(img), "label": label_col[i].as_py()})
     return rows
