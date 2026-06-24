@@ -186,6 +186,7 @@ def main():
             collate_fn=collate_fn,
             num_workers=NUM_WORKERS,
             multiprocessing_context="forkserver" if NUM_WORKERS > 0 else None,
+            pin_memory=NUM_WORKERS > 0,
         )
 
         model.train()
