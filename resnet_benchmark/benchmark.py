@@ -17,6 +17,8 @@ Each log line breaks down time into:
   - MB/s:       raw bytes fetched from storage per second
   - fetch_ms:   avg time per step waiting for LanceDB I/O
   - xform_ms:   avg time per step for JPEG decode + image transforms
+  - cpu%:       system CPU utilization averaged over the log interval
+  - sm%:        GPU streaming-multiprocessor utilization (NVML point-in-time)
 
 When data_ms >> gpu_ms the pipeline is I/O bound.
 When gpu_ms >> data_ms the GPU is the bottleneck.
@@ -37,6 +39,20 @@ import os
 import sys
 import logging
 import time
+
+try:
+    import psutil as _psutil
+    _psutil.cpu_percent()  # prime so first interval read is accurate
+    _psutil_ok = True
+except ImportError:
+    _psutil_ok = False
+
+try:
+    import pynvml as _pynvml
+    _pynvml.nvmlInit()
+    _nvml_ok = True
+except Exception:
+    _nvml_ok = False
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lancedb", "python", "python"))
 
@@ -130,6 +146,7 @@ def main():
 
     # ── Model ──────────────────────────────────────────────────────────────────
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+    nvml_handle = _pynvml.nvmlDeviceGetHandleByIndex(rank) if _nvml_ok else None
     model = models.resnet50(weights=None).to(device, dtype=torch.bfloat16)
     model = torch.compile(model, dynamic=True)
     if world_size > 1:
@@ -223,6 +240,10 @@ def main():
                 raw_depth    = dataset.raw_queue_depth
                 cooked_depth = dataset.prefetch_queue_depth
                 complete     = dataset.consumed_rows
+                cpu_pct = _psutil.cpu_percent() if _psutil_ok else None
+                sm_pct  = _pynvml.nvmlDeviceGetUtilizationRates(nvml_handle).gpu if _nvml_ok else None
+                cpu_str = f"{cpu_pct:.0f}%" if cpu_pct is not None else "n/a"
+                sm_str  = f"{sm_pct:.0f}%"  if sm_pct  is not None else "n/a"
 
                 logging.info(
                     f"epoch {epoch + 1}/{NUM_EPOCHS} "
@@ -234,7 +255,8 @@ def main():
                     f"unscanned {unscanned} raw {raw_depth} cooked {cooked_depth} complete {complete} | "
                     f"{mb_per_sec:.1f} MB/s | "
                     f"fetch {avg_fetch_ms:.1f}ms | "
-                    f"xform {avg_xform_ms:.1f}ms"
+                    f"xform {avg_xform_ms:.1f}ms | "
+                    f"cpu {cpu_str} sm {sm_str}"
                 )
                 interval_images     = 0
                 interval_gpu_ms     = 0.0
