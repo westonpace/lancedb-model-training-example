@@ -47,6 +47,7 @@ except ImportError:
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lancedb", "python", "python"))
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -78,13 +79,10 @@ PREFETCH_BATCHES = int(os.environ.get("PREFETCH_BATCHES",  1))  # Concurrent rea
 
 # ── Transforms ─────────────────────────────────────────────────────────────────
 
-_train_transform = transforms.Compose([
-    transforms.RandomResizedCrop(224),
-    transforms.RandomHorizontalFlip(),
-    transforms.ConvertImageDtype(torch.float32),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225]),
-])
+_crop = transforms.RandomResizedCrop(224)
+_flip = transforms.RandomHorizontalFlip()
+_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+_STD  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
 
 # ── Distributed helpers ────────────────────────────────────────────────────────
@@ -106,15 +104,34 @@ def cleanup_distributed():
 # ── Transform / Collate ────────────────────────────────────────────────────────
 
 def decode_transform(batch):
-    """Decode JPEG and apply image transforms in the background prefetch thread."""
-    image_col = batch.column("image")
-    label_col = batch.column("label")
-    rows = []
-    for i in range(len(batch)):
-        encoded = torch.frombuffer(bytearray(image_col[i].as_py()), dtype=torch.uint8)
-        img = decode_jpeg(encoded)  # releases GIL; returns uint8 (3, H, W) tensor
-        rows.append({"image": _train_transform(img), "label": label_col[i].as_py()})
-    return rows
+    """Decode JPEG and apply image transforms in the background prefetch thread.
+
+    Uses zero-copy access to Arrow's binary column buffers: the JPEG bytes
+    are never copied to the Python heap.  The Arrow data buffer is viewed
+    directly via numpy (zero-copy) and then handed to decode_jpeg via
+    torch.from_numpy (also zero-copy).  decode_jpeg only reads its input,
+    so the read-only Arrow memory is safe here.
+    """
+    col     = batch.column("image")
+    bufs    = col.buffers()
+    offsets = np.frombuffer(bufs[1], dtype=np.int64)  # int64 for large_binary
+    data    = np.frombuffer(bufs[2], dtype=np.uint8)
+
+    # Decode: each decode_jpeg call releases the GIL
+    imgs = [
+        decode_jpeg(torch.from_numpy(data[offsets[i] : offsets[i + 1]]))
+        for i in range(len(col))
+    ]
+
+    # Per-image crop + flip so each gets independent random parameters
+    imgs = [_flip(_crop(img)) for img in imgs]
+
+    # Stack once, then cast + normalize as a single batched op
+    batch_t = torch.stack(imgs).to(torch.float32).div_(255.0)
+    batch_t.sub_(_MEAN).div_(_STD)
+
+    labels = batch.column("label").to_pylist()
+    return [{"image": batch_t[i], "label": lbl} for i, lbl in enumerate(labels)]
 
 
 def collate_fn(rows):
