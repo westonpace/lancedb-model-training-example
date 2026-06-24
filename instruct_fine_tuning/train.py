@@ -38,8 +38,14 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model, TaskType
 from object_store import ObjectStore
+import functools
 import lancedb
 from lancedb.streaming import StreamingDataset
+
+
+def _open_table(uri: str, table_name: str):
+    """Module-level factory so it survives pickling into DataLoader workers."""
+    return lancedb.connect(uri).open_table(table_name)
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 # Ungated, fast to download. Swap for a larger model once throughput is confirmed:
@@ -241,6 +247,7 @@ def main():
             world_size=world_size,
             read_batch_size=READ_BATCH_SIZE,
             prefetch_batches=PREFETCH_BATCHES,
+            connection_factory=functools.partial(_open_table, lancedb_uri),
         )
         dataloader = DataLoader(
             dataset,
