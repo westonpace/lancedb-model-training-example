@@ -186,6 +186,10 @@ def main():
             collate_fn=collate_fn,
             num_workers=NUM_WORKERS,
             multiprocessing_context="forkserver" if NUM_WORKERS > 0 else None,
+            # pin_memory only helps when workers pre-pin batches while the GPU
+            # runs the previous step.  With num_workers=0 everything is
+            # synchronous in the main thread so pinning is in the critical
+            # path regardless — no benefit.
             pin_memory=NUM_WORKERS > 0,
         )
 
