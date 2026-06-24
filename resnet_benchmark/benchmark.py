@@ -52,8 +52,9 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
-from torchvision import models, transforms
+from torchvision import models
 from torchvision.io import decode_jpeg
+import torchvision.transforms.v2 as v2
 import functools
 import lancedb
 from lancedb.streaming import StreamingDataset
@@ -79,10 +80,18 @@ PREFETCH_BATCHES = int(os.environ.get("PREFETCH_BATCHES",  1))  # Concurrent rea
 
 # ── Transforms ─────────────────────────────────────────────────────────────────
 
-_crop = transforms.RandomResizedCrop(224)
-_flip = transforms.RandomHorizontalFlip()
-_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-_STD  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+# v2 transforms accept a stacked (N, C, H, W) uint8 batch and run the full
+# pipeline — crop, flip, cast, normalize — as a single batched C++ dispatch.
+# Trade-off: all N images in a read-batch share the same random crop/flip
+# parameters (v2 draws params once per call for paired-data consistency).
+# Fine for throughput benchmarking; for real training augmentation diversity
+# is only reduced within each 64-image fetch, not across the epoch.
+_batch_transform = v2.Compose([
+    v2.RandomResizedCrop(224),
+    v2.RandomHorizontalFlip(),
+    v2.ToDtype(torch.float32, scale=True),
+    v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
 
 
 # ── Distributed helpers ────────────────────────────────────────────────────────
@@ -106,31 +115,24 @@ def cleanup_distributed():
 def decode_transform(batch):
     """Decode JPEG and apply image transforms in the background prefetch thread.
 
-    Uses zero-copy access to Arrow's binary column buffers: the JPEG bytes
-    are never copied to the Python heap.  The Arrow data buffer is viewed
-    directly via numpy (zero-copy) and then handed to decode_jpeg via
-    torch.from_numpy (also zero-copy).  decode_jpeg only reads its input,
-    so the read-only Arrow memory is safe here.
+    Zero-copy Arrow access: numpy views the binary column buffers directly,
+    torch.from_numpy shares that memory with no heap copy.  After decoding,
+    the full augmentation pipeline runs as a single batched v2 dispatch on
+    the stacked (N, C, H, W) tensor — one C++ call instead of 64 per-image
+    Python dispatches.
     """
     col     = batch.column("image")
     bufs    = col.buffers()
     offsets = np.frombuffer(bufs[1], dtype=np.int64)  # int64 for large_binary
     data    = np.frombuffer(bufs[2], dtype=np.uint8)
 
-    # Decode: each decode_jpeg call releases the GIL
     imgs = [
         decode_jpeg(torch.from_numpy(data[offsets[i] : offsets[i + 1]]))
         for i in range(len(col))
     ]
 
-    # Per-image crop + flip so each gets independent random parameters
-    imgs = [_flip(_crop(img)) for img in imgs]
-
-    # Stack once, then cast + normalize as a single batched op
-    batch_t = torch.stack(imgs).to(torch.float32).div_(255.0)
-    batch_t.sub_(_MEAN).div_(_STD)
-
     labels = batch.column("label").to_pylist()
+    batch_t = _batch_transform(torch.stack(imgs))
     return [{"image": batch_t[i], "label": lbl} for i, lbl in enumerate(labels)]
 
 
