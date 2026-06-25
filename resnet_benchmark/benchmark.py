@@ -36,6 +36,7 @@ import os
 import sys
 import logging
 import time
+import threading
 
 try:
     import psutil as _psutil
@@ -195,6 +196,121 @@ class DataPrefetcher:
         return images, labels
 
 
+# ── GPU utilisation sampler ────────────────────────────────────────────────────
+
+class GpuUtilSampler:
+    """Background-thread GPU utilisation sampler.
+
+    Preferred path — pydcgm DCGM_FI_PROF_SM_ACTIVE: the fraction of time
+    at least one warp is active on an SM, averaged over the measurement
+    window.  This is the same metric nvtop shows on Ampere/Ada GPUs and
+    gives a true SM-level utilisation rather than NVML's coarser "did any
+    kernel run in the last ~167 ms" window counter.
+
+    Fallback — pynvml nvmlDeviceGetUtilizationRates().gpu sampled at high
+    frequency in this thread and averaged over the log interval.  Much
+    better than a single point-in-time read (which always lands mid-compute
+    and reports ~100%) even though it is still the coarser NVML counter.
+
+    If neither library is available the sampler is a no-op.
+    """
+
+    def __init__(self, device_index: int, interval_ms: int = 100):
+        self._interval  = interval_ms / 1000.0
+        self._lock      = threading.Lock()
+        self._samples   = []
+        self._stop      = threading.Event()
+        self._sample_fn = None
+        self._label     = "n/a"
+
+        self._sample_fn, self._label = self._init(device_index)
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _init(self, idx):
+        try:
+            return self._init_dcgm(idx), "sm%"
+        except Exception as exc:
+            logging.debug("pydcgm unavailable (%s); trying pynvml", exc)
+        try:
+            return self._init_pynvml(idx), "gpu%"
+        except Exception as exc:
+            logging.debug("pynvml unavailable (%s); GPU util disabled", exc)
+        return None, "n/a"
+
+    def _init_dcgm(self, idx):
+        # NGC containers ship pydcgm outside the default Python path.
+        for p in ("/usr/local/dcgm/bindings/python3",):
+            if p not in sys.path:
+                sys.path.insert(0, p)
+
+        import pydcgm                   # type: ignore
+        import dcgm_structs as _s       # type: ignore
+        import dcgm_fields  as _f       # type: ignore
+
+        handle = pydcgm.DcgmHandle(opMode=_s.DCGM_OPERATION_MODE_AUTO)
+        group  = pydcgm.DcgmGroup(handle, groupName=f"bench_{idx}",
+                                   groupType=_s.DCGM_GROUP_DEFAULT)
+        fg     = pydcgm.DcgmFieldGroup(handle, f"bench_fg_{idx}",
+                                        [_f.DCGM_FI_PROF_SM_ACTIVE])
+        # 10 ms update frequency; keep 30 s of history
+        group.samples.WatchFields(fg, 10_000, 30.0, 0)
+        handle.GetSystem().UpdateAllFields(waitForUpdate=True)
+
+        FIELD = _f.DCGM_FI_PROF_SM_ACTIVE
+
+        def sample():
+            handle.GetSystem().UpdateAllFields(waitForUpdate=False)
+            latest = group.samples.GetLatest(fg)
+            gpu_vals = latest.values
+            if idx in gpu_vals and FIELD in gpu_vals[idx]:
+                v = gpu_vals[idx][FIELD].value
+                if isinstance(v, (int, float)) and v >= 0:
+                    return float(v) * 100.0   # DCGM returns 0.0–1.0
+            return None
+
+        # Confirm we actually get data before committing to this path.
+        if sample() is None:
+            raise RuntimeError(f"DCGM_FI_PROF_SM_ACTIVE returned no data for GPU {idx}")
+        return sample
+
+    def _init_pynvml(self, idx):
+        import pynvml                   # type: ignore
+        pynvml.nvmlInit()
+        h = pynvml.nvmlDeviceGetHandleByIndex(idx)
+
+        def sample():
+            return float(pynvml.nvmlDeviceGetUtilizationRates(h).gpu)
+
+        return sample
+
+    def _run(self):
+        if self._sample_fn is None:
+            return
+        while not self._stop.wait(self._interval):
+            try:
+                v = self._sample_fn()
+                if v is not None:
+                    with self._lock:
+                        self._samples.append(v)
+            except Exception:
+                pass
+
+    @property
+    def label(self):
+        return self._label
+
+    def read_and_reset(self):
+        with self._lock:
+            if not self._samples:
+                return "n/a"
+            avg = sum(self._samples) / len(self._samples)
+            self._samples.clear()
+        return f"{avg:.0f}%"
+
+    def close(self):
+        self._stop.set()
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -213,8 +329,8 @@ def main():
         sys.exit(1)
 
     # ── Model ──────────────────────────────────────────────────────────────────
-    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
-    total_vram = torch.cuda.get_device_properties(device).total_memory if device.type == "cuda" else 0
+    device     = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+    gpu_sampler = GpuUtilSampler(rank) if device.type == "cuda" else None
     model = models.resnet50(weights=None).to(device, dtype=torch.bfloat16)
     model = torch.compile(model, dynamic=True)
     if world_size > 1:
@@ -314,11 +430,8 @@ def main():
                 cooked_depth = dataset.prefetch_queue_depth
                 complete     = dataset.consumed_rows
                 cpu_str = f"{_psutil.cpu_percent():.0f}%" if _psutil_ok else "n/a"
-                if total_vram > 0:
-                    vram_pct = torch.cuda.memory_allocated(device) / total_vram * 100
-                    vram_str = f"{vram_pct:.0f}%"
-                else:
-                    vram_str = "n/a"
+                gpu_str = gpu_sampler.read_and_reset() if gpu_sampler else "n/a"
+                gpu_lbl = gpu_sampler.label if gpu_sampler else "gpu%"
 
                 logging.info(
                     f"epoch {epoch + 1}/{NUM_EPOCHS} "
@@ -331,7 +444,7 @@ def main():
                     f"{mb_per_sec:.1f} MB/s | "
                     f"ld {avg_fetch_ms:.1f}ms | "
                     f"xf {avg_xform_ms:.1f}ms | "
-                    f"cpu {cpu_str} vram {vram_str}"
+                    f"cpu {cpu_str} {gpu_lbl} {gpu_str}"
                 )
                 interval_images     = 0
                 interval_gpu_ms     = 0.0
@@ -348,6 +461,8 @@ def main():
                 f"{total_images / (time.perf_counter() - training_start):,.0f} avg img/s"
             )
 
+    if gpu_sampler:
+        gpu_sampler.close()
     cleanup_distributed()
 
 
