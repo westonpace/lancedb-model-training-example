@@ -143,6 +143,58 @@ def collate_fn(rows):
     )
 
 
+# ── Prefetcher ─────────────────────────────────────────────────────────────────
+
+class DataPrefetcher:
+    """Overlap H2D transfer with GPU computation via a secondary CUDA stream.
+
+    Without prefetching the critical path per step is:
+      GPU done → next(dataloader) → H2D (12 ms on PCIe 3.0) → GPU starts
+    With prefetching:
+      GPU starts batch N
+        └─ side stream: H2D batch N+1 (12 ms, runs concurrently on PCIe)
+      GPU done (465 ms later) → wait_stream (instant) → GPU starts N+1
+
+    The H2D cost is absorbed into the GPU step, so data_ms → ~0.
+    pin_memory=True on the DataLoader is required: non_blocking H2D only
+    bypasses the CPU↔GPU copy synchronisation when the source is pinned.
+    """
+
+    def __init__(self, loader, device, dtype=None):
+        self._iter   = iter(loader)
+        self._device = device
+        self._dtype  = dtype
+        self._stream = torch.cuda.Stream(device)
+        self._images = None
+        self._labels = None
+        self._preload()
+
+    def _preload(self):
+        try:
+            images, labels = next(self._iter)
+        except StopIteration:
+            self._images = None
+            return
+        with torch.cuda.stream(self._stream):
+            self._images = images.to(self._device, dtype=self._dtype, non_blocking=True)
+            self._labels = labels.to(self._device, non_blocking=True)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        torch.cuda.current_stream().wait_stream(self._stream)
+        images = self._images
+        labels = self._labels
+        if images is None:
+            raise StopIteration
+        # Tell CUDA not to reclaim this memory until the current stream is done.
+        images.record_stream(torch.cuda.current_stream())
+        labels.record_stream(torch.cuda.current_stream())
+        self._preload()
+        return images, labels
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -227,9 +279,8 @@ def main():
         prev_fetch_time    = dataset.fetch_time
         prev_transform_time = dataset.transform_time
 
-        for step, (images, labels) in enumerate(dataloader):
-            images = images.to(device, dtype=torch.bfloat16, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+        prefetcher = DataPrefetcher(dataloader, device, dtype=torch.bfloat16)
+        for step, (images, labels) in enumerate(prefetcher):
 
             start_event.record()
             outputs = model(images)
