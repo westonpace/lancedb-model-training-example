@@ -83,7 +83,7 @@ NUM_EPOCHS = 100
 # 64 works for 1, 2, 4, 8, 16, or 32 GPUs.
 NUM_SPLITS = 64
 NUM_WORKERS = 1       # DataLoader workers per GPU.
-BATCH_SIZE = 4        # Per-GPU micro-batch size.
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 64))  # Per-GPU micro-batch size.
 MAX_LENGTH = 512      # Truncate sequences to this many tokens.
 SHUFFLE_SEED = 42
 LEARNING_RATE = 2e-4
