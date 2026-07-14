@@ -87,8 +87,12 @@ BATCH_SIZE    = int(os.environ.get("BATCH_SIZE", 64))   # Per-GPU micro-batch si
 TORCH_COMPILE = os.environ.get("TORCH_COMPILE", "1") not in ("0", "false", "False")
 MAX_LENGTH = 512      # Truncate sequences to this many tokens.
 SHUFFLE_SEED = 42
-LEARNING_RATE = 2e-4
-LOG_INTERVAL = 50     # Log throughput every N steps.
+_BASE_LR      = 2e-4                                          # LR calibrated for batch size 4.
+_BASE_BATCH   = 4
+LEARNING_RATE = float(os.environ.get("LEARNING_RATE",
+                      _BASE_LR * (BATCH_SIZE / _BASE_BATCH))) # Linear scaling rule.
+GRAD_CLIP     = float(os.environ.get("GRAD_CLIP", 1.0))
+LOG_INTERVAL  = 50    # Log throughput every N steps.
 
 # StreamingDataset I/O tuning
 READ_BATCH_SIZE  = 64   # Rows fetched per split per take_offsets call.
@@ -386,6 +390,8 @@ def main():
         model = torch.compile(model, dynamic=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    if is_main:
+        logging.info(f"Batch size: {BATCH_SIZE} | lr: {LEARNING_RATE:.2e} | grad_clip: {GRAD_CLIP}")
 
     # ── LanceDB ───────────────────────────────────────────────────────────────
     db = lancedb.connect(lancedb_uri)
@@ -451,7 +457,7 @@ def main():
             loss = outputs.loss
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             optimizer.step()
             end_event.record()
             torch.cuda.synchronize()
