@@ -84,8 +84,9 @@ NUM_EPOCHS = 100
 NUM_SPLITS = 64
 NUM_WORKERS = 1       # DataLoader workers per GPU.
 BATCH_SIZE    = int(os.environ.get("BATCH_SIZE", 64))   # Per-GPU micro-batch size.
-TORCH_COMPILE  = os.environ.get("TORCH_COMPILE", "1") not in ("0", "false", "False")
-MEMORY_DEBUG   = os.environ.get("MEMORY_DEBUG",  "0") not in ("0", "false", "False")
+TORCH_COMPILE  = os.environ.get("TORCH_COMPILE",  "1") not in ("0", "false", "False")
+GRAD_CKPT      = os.environ.get("GRAD_CKPT",      "1") not in ("0", "false", "False")
+MEMORY_DEBUG   = os.environ.get("MEMORY_DEBUG",   "0") not in ("0", "false", "False")
 MAX_LENGTH = 512      # Truncate sequences to this many tokens.
 SHUFFLE_SEED = 42
 _BASE_LR      = 2e-4                                          # LR calibrated for batch size 4.
@@ -391,6 +392,9 @@ def main():
         task_type=TaskType.CAUSAL_LM,
     )
     model = get_peft_model(model, lora_config)
+    if GRAD_CKPT:
+        model.enable_input_require_grads()
+        model.gradient_checkpointing_enable()
     if is_main:
         model.print_trainable_parameters()
 
@@ -406,7 +410,7 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     mem_checkpoint("optimizer initialized")
     if is_main:
-        logging.info(f"Batch size: {BATCH_SIZE} | lr: {LEARNING_RATE:.2e} | grad_clip: {GRAD_CLIP}")
+        logging.info(f"Batch size: {BATCH_SIZE} | lr: {LEARNING_RATE:.2e} | grad_clip: {GRAD_CLIP} | grad_ckpt: {GRAD_CKPT}")
 
     # ── LanceDB ───────────────────────────────────────────────────────────────
     db = lancedb.connect(lancedb_uri)
