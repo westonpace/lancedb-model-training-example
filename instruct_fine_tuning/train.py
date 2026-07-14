@@ -82,7 +82,7 @@ NUM_EPOCHS = 100
 # Must divide evenly into world_size.
 # 64 works for 1, 2, 4, 8, 16, or 32 GPUs.
 NUM_SPLITS = 64
-NUM_WORKERS = 0       # DataLoader workers per GPU. Start at 0; increase if I/O bound.
+NUM_WORKERS = 1       # DataLoader workers per GPU.
 BATCH_SIZE = 4        # Per-GPU micro-batch size.
 MAX_LENGTH = 512      # Truncate sequences to this many tokens.
 SHUFFLE_SEED = 42
@@ -165,7 +165,7 @@ def format_example(row: dict) -> str:
     return f"### Instruction:\n{instruction}\n\n### Response:\n{output}"
 
 
-def make_tokenize_transform(tokenizer):
+class TokenizeTransform:
     """Tokenize a full Arrow read-batch inside StreamingDataset's transform hook.
 
     Runs on READ_BATCH_SIZE rows at once so the tokenizer's batched C++ path
@@ -173,20 +173,26 @@ def make_tokenize_transform(tokenizer):
     padding to the training micro-batch maximum happens in collate_fn.
     Running here means tokenization time is captured in dataset.transform_time
     and shows up in the xf column of the training log.
+
+    Implemented as a class (not a closure) so it is picklable — required when
+    NUM_WORKERS > 0 uses forkserver to send the dataset to worker processes.
     """
-    def tokenize_transform(batch):
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def __call__(self, batch):
         rows = batch.to_pylist()
-        texts = [format_example(row) + tokenizer.eos_token for row in rows]
-        encoded = tokenizer(texts, max_length=MAX_LENGTH, truncation=True)
+        texts = [format_example(row) + self.tokenizer.eos_token for row in rows]
+        encoded = self.tokenizer(texts, max_length=MAX_LENGTH, truncation=True)
         result = []
         for ids, mask in zip(encoded["input_ids"], encoded["attention_mask"]):
             ids_t  = torch.tensor(ids,  dtype=torch.long)
             mask_t = torch.tensor(mask, dtype=torch.long)
             labels = ids_t.clone()
-            labels[labels == tokenizer.pad_token_id] = -100
+            labels[labels == self.tokenizer.pad_token_id] = -100
             result.append({"input_ids": ids_t, "attention_mask": mask_t, "labels": labels})
         return result
-    return tokenize_transform
 
 
 def collate_fn(batch):
@@ -385,7 +391,7 @@ def main():
     if is_main:
         logging.info(f"LanceDB table: {len(table)} rows, {NUM_SPLITS} splits")
 
-    tokenize_transform = make_tokenize_transform(tokenizer)
+    tokenize_transform = TokenizeTransform(tokenizer)
 
     # ── CUDA timing events ─────────────────────────────────────────────────────
     start_event = torch.cuda.Event(enable_timing=True)
@@ -417,6 +423,7 @@ def main():
             collate_fn=collate_fn,
             num_workers=NUM_WORKERS,
             multiprocessing_context="forkserver" if NUM_WORKERS > 0 else None,
+            pin_memory=NUM_WORKERS > 0,
         )
 
         model.train()
