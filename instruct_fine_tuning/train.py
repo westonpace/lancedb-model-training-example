@@ -10,6 +10,21 @@ Prerequisites:
     3. Prepare data:
            LANCEDB_URI=s3://my-bucket/data python prepare_data.py
 
+Each log line breaks down time into:
+  - tok/s:     tokens processed per second over the log interval (wall-clock)
+  - rows/s:    training examples processed per second over the log interval
+  - gpu_ms:    time spent on forward + backward + optimizer step (GPU-side)
+  - data_ms:   wall-clock time per step minus gpu_ms (CPU/IO-side)
+  - u/r/c/d:   pipeline row counts: unscanned / raw / cooked / done
+  - MB/s:      raw bytes fetched from storage per second
+  - ld:        avg time per step waiting for LanceDB I/O (load)
+  - xf:        avg time per step for any StreamingDataset transform
+  - cpu%:      system CPU utilization averaged over the log interval
+  - gpu%/sm%:  GPU utilization (pynvml coarse or DCGM SM-active)
+
+When data_ms >> gpu_ms the pipeline is I/O bound.
+When gpu_ms >> data_ms the GPU is the bottleneck.
+
 Required environment variables:
     LANCEDB_URI      URI of the LanceDB database  (e.g. s3://my-bucket/data)
     CHECKPOINT_URI   URI for checkpoint storage    (e.g. s3://my-bucket/checkpoints)
@@ -27,7 +42,15 @@ import sys
 import logging
 import time
 import tempfile
+import threading
 from urllib.parse import urlparse
+
+try:
+    import psutil as _psutil
+    _psutil.cpu_percent()  # prime so first interval read is accurate
+    _psutil_ok = True
+except ImportError:
+    _psutil_ok = False
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lancedb", "python", "python"))
 
@@ -108,7 +131,6 @@ def _parse_uri(uri: str):
     return base, prefix
 
 
-
 def save_checkpoint(store: ObjectStore, prefix: str, name: str, obj) -> None:
     buf = io.BytesIO()
     torch.save(obj, buf)
@@ -163,6 +185,118 @@ def make_collate_fn(tokenizer):
     return collate_fn
 
 
+# ── GPU utilisation sampler ────────────────────────────────────────────────────
+
+class GpuUtilSampler:
+    """Background-thread GPU utilisation sampler.
+
+    Preferred path — pydcgm DCGM_FI_PROF_SM_ACTIVE: the fraction of time
+    at least one warp is active on an SM, averaged over the measurement
+    window.  This is the same metric nvtop shows on Ampere/Ada GPUs and
+    gives a true SM-level utilisation rather than NVML's coarser "did any
+    kernel run in the last ~167 ms" window counter.
+
+    Fallback — pynvml nvmlDeviceGetUtilizationRates().gpu sampled at high
+    frequency in this thread and averaged over the log interval.  Much
+    better than a single point-in-time read (which always lands mid-compute
+    and reports ~100%) even though it is still the coarser NVML counter.
+
+    If neither library is available the sampler is a no-op.
+    """
+
+    def __init__(self, device_index: int, interval_ms: int = 100):
+        self._interval  = interval_ms / 1000.0
+        self._lock      = threading.Lock()
+        self._samples   = []
+        self._stop      = threading.Event()
+        self._sample_fn = None
+        self._label     = "n/a"
+
+        self._sample_fn, self._label = self._init(device_index)
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _init(self, idx):
+        try:
+            return self._init_dcgm(idx), "sm%"
+        except Exception as exc:
+            logging.debug("pydcgm unavailable (%s); trying pynvml", exc)
+        try:
+            return self._init_pynvml(idx), "gpu%"
+        except Exception as exc:
+            logging.debug("pynvml unavailable (%s); GPU util disabled", exc)
+        return None, "n/a"
+
+    def _init_dcgm(self, idx):
+        for p in ("/usr/local/dcgm/bindings/python3",):
+            if p not in sys.path:
+                sys.path.insert(0, p)
+
+        import pydcgm                   # type: ignore
+        import dcgm_structs as _s       # type: ignore
+        import dcgm_fields  as _f       # type: ignore
+
+        handle = pydcgm.DcgmHandle(opMode=_s.DCGM_OPERATION_MODE_AUTO)
+        group  = pydcgm.DcgmGroup(handle, groupName=f"train_{idx}",
+                                   groupType=_s.DCGM_GROUP_DEFAULT)
+        fg     = pydcgm.DcgmFieldGroup(handle, f"train_fg_{idx}",
+                                        [_f.DCGM_FI_PROF_SM_ACTIVE])
+        group.samples.WatchFields(fg, 10_000, 30.0, 0)
+        handle.GetSystem().UpdateAllFields(waitForUpdate=True)
+
+        FIELD = _f.DCGM_FI_PROF_SM_ACTIVE
+
+        def sample():
+            handle.GetSystem().UpdateAllFields(waitForUpdate=False)
+            latest = group.samples.GetLatest(fg)
+            gpu_vals = latest.values
+            if idx in gpu_vals and FIELD in gpu_vals[idx]:
+                v = gpu_vals[idx][FIELD].value
+                if isinstance(v, (int, float)) and v >= 0:
+                    return float(v) * 100.0
+            return None
+
+        if sample() is None:
+            raise RuntimeError(f"DCGM_FI_PROF_SM_ACTIVE returned no data for GPU {idx}")
+        return sample
+
+    def _init_pynvml(self, idx):
+        import pynvml                   # type: ignore
+        pynvml.nvmlInit()
+        h = pynvml.nvmlDeviceGetHandleByIndex(idx)
+
+        def sample():
+            return float(pynvml.nvmlDeviceGetUtilizationRates(h).gpu)
+
+        return sample
+
+    def _run(self):
+        if self._sample_fn is None:
+            return
+        while not self._stop.wait(self._interval):
+            try:
+                v = self._sample_fn()
+                if v is not None:
+                    with self._lock:
+                        self._samples.append(v)
+            except Exception:
+                pass
+
+    @property
+    def label(self):
+        return self._label
+
+    def read_and_reset(self):
+        with self._lock:
+            if not self._samples:
+                return "n/a"
+            avg = sum(self._samples) / len(self._samples)
+            self._samples.clear()
+        return f"{avg:.0f}%"
+
+    def close(self):
+        self._stop.set()
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -215,6 +349,7 @@ def main():
         model.print_trainable_parameters()
 
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+    gpu_sampler = GpuUtilSampler(rank) if device.type == "cuda" else None
     model = model.to(device)
     if world_size > 1:
         model = DDP(model, device_ids=[rank], find_unused_parameters=False)
@@ -229,6 +364,10 @@ def main():
         logging.info(f"LanceDB table: {len(table)} rows, {NUM_SPLITS} splits")
 
     collate_fn = make_collate_fn(tokenizer)
+
+    # ── CUDA timing events ─────────────────────────────────────────────────────
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event   = torch.cuda.Event(enable_timing=True)
 
     # ── Training loop ─────────────────────────────────────────────────────────
     total_tokens = 0
@@ -258,44 +397,85 @@ def main():
         )
 
         model.train()
-        epoch_loss = 0.0
-        epoch_steps = 0
+        epoch_loss   = 0.0
+        epoch_steps  = 0
         epoch_tokens = 0
-        epoch_rows = 0
+
+        interval_tokens      = 0
+        interval_rows        = 0
+        interval_gpu_ms      = 0.0
+        interval_start       = time.perf_counter()
+        prev_bytes_loaded    = dataset.bytes_loaded
+        prev_fetch_time      = dataset.fetch_time
+        prev_transform_time  = dataset.transform_time
 
         for step, batch in enumerate(dataloader):
-            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            input_ids      = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            labels = batch["labels"].to(device, non_blocking=True)
+            labels         = batch["labels"].to(device, non_blocking=True)
 
+            start_event.record()
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             loss = outputs.loss
-
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            end_event.record()
+            torch.cuda.synchronize()
+            gpu_ms = start_event.elapsed_time(end_event)
 
-            batch_rows = input_ids.shape[0]
+            batch_rows   = input_ids.shape[0]
             batch_tokens = int(attention_mask.sum())
-            epoch_rows += batch_rows
-            epoch_tokens += batch_tokens
-            total_tokens += batch_tokens
-            epoch_loss += loss.item()
-            epoch_steps += 1
-            total_steps += 1
+            epoch_tokens    += batch_tokens
+            total_tokens    += batch_tokens
+            epoch_loss      += loss.item()
+            epoch_steps     += 1
+            total_steps     += 1
+            interval_tokens += batch_tokens
+            interval_rows   += batch_rows
+            interval_gpu_ms += gpu_ms
 
             if is_main and total_steps % LOG_INTERVAL == 0:
-                elapsed = time.perf_counter() - training_start
-                tok_per_sec = total_tokens / elapsed
-                rows_per_sec = epoch_rows / (time.perf_counter() - epoch_start)
+                elapsed      = time.perf_counter() - interval_start
+                tok_per_sec  = interval_tokens / elapsed if elapsed > 0 else 0.0
+                rows_per_sec = interval_rows / elapsed if elapsed > 0 else 0.0
+                avg_gpu_ms   = interval_gpu_ms / LOG_INTERVAL
+                avg_data_ms  = elapsed * 1000 / LOG_INTERVAL - avg_gpu_ms
+
+                interval_mb  = (dataset.bytes_loaded - prev_bytes_loaded) / 1e6
+                mb_per_sec   = interval_mb / elapsed if elapsed > 0 else 0.0
+                avg_fetch_ms = (dataset.fetch_time - prev_fetch_time) * 1000 / LOG_INTERVAL
+                avg_xform_ms = (dataset.transform_time - prev_transform_time) * 1000 / LOG_INTERVAL
+                unscanned    = dataset.unscanned_rows
+                raw_depth    = dataset.raw_queue_depth
+                cooked_depth = dataset.prefetch_queue_depth
+                complete     = dataset.consumed_rows
+                cpu_str      = f"{_psutil.cpu_percent():.0f}%" if _psutil_ok else "n/a"
+                gpu_str      = gpu_sampler.read_and_reset() if gpu_sampler else "n/a"
+                gpu_lbl      = gpu_sampler.label if gpu_sampler else "gpu%"
+
                 logging.info(
                     f"epoch {epoch + 1:3d}/{NUM_EPOCHS} "
                     f"step {step + 1:5d} | "
                     f"loss {loss.item():.4f} | "
                     f"{tok_per_sec:,.0f} tok/s | "
-                    f"{rows_per_sec:,.0f} rows/s"
+                    f"{rows_per_sec:.1f} rows/s | "
+                    f"gpu {avg_gpu_ms:.1f}ms | "
+                    f"data {avg_data_ms:.1f}ms | "
+                    f"{unscanned}/{raw_depth}/{cooked_depth}/{complete} | "
+                    f"{mb_per_sec:.1f} MB/s | "
+                    f"ld {avg_fetch_ms:.1f}ms | "
+                    f"xf {avg_xform_ms:.1f}ms | "
+                    f"cpu {cpu_str} {gpu_lbl} {gpu_str}"
                 )
+                interval_tokens     = 0
+                interval_rows       = 0
+                interval_gpu_ms     = 0.0
+                interval_start      = time.perf_counter()
+                prev_bytes_loaded   = dataset.bytes_loaded
+                prev_fetch_time     = dataset.fetch_time
+                prev_transform_time = dataset.transform_time
 
         epoch_time = time.perf_counter() - epoch_start
         if is_main:
@@ -307,7 +487,6 @@ def main():
                 f"{epoch_tokens:,} tokens"
             )
 
-            # Save dataset state for resumability
             checkpoint = {
                 "epoch": epoch,
                 "dataset_state": dataset.state_dict(),
@@ -326,11 +505,12 @@ def main():
             f"{total_tokens:,} total tokens | "
             f"{total_tokens / elapsed:,.0f} avg tok/s"
         )
-        # Save final LoRA adapter
         base = model.module if world_size > 1 else model
         save_adapter(checkpoint_store, checkpoint_prefix, base, tokenizer)
         logging.info(f"Adapter saved to {checkpoint_uri}/final_adapter")
 
+    if gpu_sampler:
+        gpu_sampler.close()
     cleanup_distributed()
 
 
@@ -338,7 +518,6 @@ if __name__ == "__main__":
     import multiprocessing
     import resource
     multiprocessing.set_start_method("forkserver")
-    # torch.compile opens many files while tracing; raise the fd limit to avoid EMFILE.
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (min(65536, hard), hard))
     main()
