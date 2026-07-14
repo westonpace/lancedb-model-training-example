@@ -84,7 +84,8 @@ NUM_EPOCHS = 100
 NUM_SPLITS = 64
 NUM_WORKERS = 1       # DataLoader workers per GPU.
 BATCH_SIZE    = int(os.environ.get("BATCH_SIZE", 64))   # Per-GPU micro-batch size.
-TORCH_COMPILE = os.environ.get("TORCH_COMPILE", "1") not in ("0", "false", "False")
+TORCH_COMPILE  = os.environ.get("TORCH_COMPILE", "1") not in ("0", "false", "False")
+MEMORY_DEBUG   = os.environ.get("MEMORY_DEBUG",  "0") not in ("0", "false", "False")
 MAX_LENGTH = 512      # Truncate sequences to this many tokens.
 SHUFFLE_SEED = 42
 _BASE_LR      = 2e-4                                          # LR calibrated for batch size 4.
@@ -216,6 +217,17 @@ def collate_fn(batch):
         "attention_mask": torch.stack(attention_mask_out),
         "labels":         torch.stack(labels_out),
     }
+
+
+# ── Memory debug helper ───────────────────────────────────────────────────────
+
+def mem_checkpoint(label: str) -> None:
+    if not MEMORY_DEBUG or not torch.cuda.is_available():
+        return
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated() / 1024**3
+    reserved  = torch.cuda.memory_reserved()  / 1024**3
+    logging.info(f"[mem] {label}: {allocated:.2f} GiB allocated, {reserved:.2f} GiB reserved")
 
 
 # ── GPU utilisation sampler ────────────────────────────────────────────────────
@@ -368,6 +380,7 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16)
+    mem_checkpoint("base model loaded (CPU)")
 
     lora_config = LoraConfig(
         r=LORA_R,
@@ -384,12 +397,14 @@ def main():
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
     gpu_sampler = GpuUtilSampler(rank) if device.type == "cuda" else None
     model = model.to(device)
+    mem_checkpoint("model + LoRA moved to GPU")
     if world_size > 1:
         model = DDP(model, device_ids=[rank], find_unused_parameters=False)
     if TORCH_COMPILE:
         model = torch.compile(model, dynamic=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    mem_checkpoint("optimizer initialized")
     if is_main:
         logging.info(f"Batch size: {BATCH_SIZE} | lr: {LEARNING_RATE:.2e} | grad_clip: {GRAD_CLIP}")
 
@@ -452,13 +467,21 @@ def main():
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             labels         = batch["labels"].to(device, non_blocking=True)
 
+            if step == 0:
+                mem_checkpoint("before first forward pass")
             start_event.record()
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             loss = outputs.loss
+            if step == 0:
+                mem_checkpoint("after first forward pass")
             optimizer.zero_grad()
             loss.backward()
+            if step == 0:
+                mem_checkpoint("after first backward pass")
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             optimizer.step()
+            if step == 0:
+                mem_checkpoint("after first optimizer step")
             end_event.record()
             torch.cuda.synchronize()
             gpu_ms = start_event.elapsed_time(end_event)
