@@ -165,24 +165,46 @@ def format_example(row: dict) -> str:
     return f"### Instruction:\n{instruction}\n\n### Response:\n{output}"
 
 
-def make_collate_fn(tokenizer):
-    def collate_fn(batch):
-        texts = [format_example(row) + tokenizer.eos_token for row in batch]
-        encoded = tokenizer(
-            texts,
-            max_length=MAX_LENGTH,
-            truncation=True,
-            padding=True,
-            return_tensors="pt",
-        )
-        labels = encoded["input_ids"].clone()
-        labels[labels == tokenizer.pad_token_id] = -100
-        return {
-            "input_ids": encoded["input_ids"],
-            "attention_mask": encoded["attention_mask"],
-            "labels": labels,
-        }
-    return collate_fn
+def make_tokenize_transform(tokenizer):
+    """Tokenize a full Arrow read-batch inside StreamingDataset's transform hook.
+
+    Runs on READ_BATCH_SIZE rows at once so the tokenizer's batched C++ path
+    is used.  Each returned item holds variable-length (un-padded) tensors;
+    padding to the training micro-batch maximum happens in collate_fn.
+    Running here means tokenization time is captured in dataset.transform_time
+    and shows up in the xf column of the training log.
+    """
+    def tokenize_transform(batch):
+        rows = batch.to_pylist()
+        texts = [format_example(row) + tokenizer.eos_token for row in rows]
+        encoded = tokenizer(texts, max_length=MAX_LENGTH, truncation=True)
+        result = []
+        for ids, mask in zip(encoded["input_ids"], encoded["attention_mask"]):
+            ids_t  = torch.tensor(ids,  dtype=torch.long)
+            mask_t = torch.tensor(mask, dtype=torch.long)
+            labels = ids_t.clone()
+            labels[labels == tokenizer.pad_token_id] = -100
+            result.append({"input_ids": ids_t, "attention_mask": mask_t, "labels": labels})
+        return result
+    return tokenize_transform
+
+
+def collate_fn(batch):
+    """Pad a micro-batch of pre-tokenized variable-length sequences and stack."""
+    max_len = max(r["input_ids"].shape[0] for r in batch)
+    input_ids_out      = []
+    attention_mask_out = []
+    labels_out         = []
+    for r in batch:
+        pad = max_len - r["input_ids"].shape[0]
+        input_ids_out.append(torch.nn.functional.pad(r["input_ids"],      (0, pad), value=0))
+        attention_mask_out.append(torch.nn.functional.pad(r["attention_mask"], (0, pad), value=0))
+        labels_out.append(torch.nn.functional.pad(r["labels"],       (0, pad), value=-100))
+    return {
+        "input_ids":      torch.stack(input_ids_out),
+        "attention_mask": torch.stack(attention_mask_out),
+        "labels":         torch.stack(labels_out),
+    }
 
 
 # ── GPU utilisation sampler ────────────────────────────────────────────────────
@@ -363,7 +385,7 @@ def main():
     if is_main:
         logging.info(f"LanceDB table: {len(table)} rows, {NUM_SPLITS} splits")
 
-    collate_fn = make_collate_fn(tokenizer)
+    tokenize_transform = make_tokenize_transform(tokenizer)
 
     # ── CUDA timing events ─────────────────────────────────────────────────────
     start_event = torch.cuda.Event(enable_timing=True)
@@ -386,6 +408,7 @@ def main():
             world_size=world_size,
             read_batch_size=READ_BATCH_SIZE,
             prefetch_batches=PREFETCH_BATCHES,
+            transform=tokenize_transform,
             connection_factory=functools.partial(_open_table, lancedb_uri),
         )
         dataloader = DataLoader(
