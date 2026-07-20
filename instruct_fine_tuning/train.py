@@ -220,6 +220,46 @@ def collate_fn(batch):
     }
 
 
+# ── Prefetcher ─────────────────────────────────────────────────────────────────
+
+class DataPrefetcher:
+    """Overlap H2D transfer with GPU computation via a secondary CUDA stream.
+
+    While the compute stream runs the forward/backward pass on batch N, the
+    copy stream transfers batch N+1 from pinned host memory to device memory.
+    Requires pin_memory=True on the DataLoader.
+    """
+
+    def __init__(self, loader, device):
+        self._iter   = iter(loader)
+        self._device = device
+        self._stream = torch.cuda.Stream(device)
+        self._batch  = None
+        self._preload()
+
+    def _preload(self):
+        try:
+            batch = next(self._iter)
+        except StopIteration:
+            self._batch = None
+            return
+        with torch.cuda.stream(self._stream):
+            self._batch = {k: v.to(self._device, non_blocking=True) for k, v in batch.items()}
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        torch.cuda.current_stream().wait_stream(self._stream)
+        batch = self._batch
+        if batch is None:
+            raise StopIteration
+        for v in batch.values():
+            v.record_stream(torch.cuda.current_stream())
+        self._preload()
+        return batch
+
+
 # ── Memory debug helper ───────────────────────────────────────────────────────
 
 def mem_checkpoint(label: str) -> None:
@@ -466,10 +506,11 @@ def main():
         prev_fetch_time      = dataset.fetch_time
         prev_transform_time  = dataset.transform_time
 
-        for step, batch in enumerate(dataloader):
-            input_ids      = batch["input_ids"].to(device, non_blocking=True)
-            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            labels         = batch["labels"].to(device, non_blocking=True)
+        prefetcher = DataPrefetcher(dataloader, device) if device.type == "cuda" else dataloader
+        for step, batch in enumerate(prefetcher):
+            input_ids      = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
+            labels         = batch["labels"]
 
             if step == 0:
                 mem_checkpoint("before first forward pass")
